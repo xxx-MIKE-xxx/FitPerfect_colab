@@ -1,0 +1,23 @@
+{
+  "dev": {
+    "awscloudformation": {
+      "AuthRoleName": "amplify-fitperfect-dev-ed5ec-authRole",
+      "UnauthRoleArn": "arn:aws:iam::525179705615:role/amplify-fitperfect-dev-ed5ec-unauthRole",
+      "AuthRoleArn": "arn:aws:iam::525179705615:role/amplify-fitperfect-dev-ed5ec-authRole",
+      "Region": "eu-central-1",
+      "DeploymentBucketName": "amplify-fitperfect-dev-ed5ec-deployment",
+      "UnauthRoleName": "amplify-fitperfect-dev-ed5ec-unauthRole",
+      "StackName": "amplify-fitperfect-dev-ed5ec",
+      "StackId": "arn:aws:cloudformation:eu-central-1:525179705615:stack/amplify-fitperfect-dev-ed5ec/15825e60-33e8-11f0-a149-0aeea7571a49",
+      "AmplifyAppId": "d2f6nijrfx17hk"
+    },
+    "categories": {
+      "auth": {
+        "fitperfect108762a3": {}
+      },
+      "storage": {
+        "exercisevideos": {}
+      }
+    }
+  }
+}

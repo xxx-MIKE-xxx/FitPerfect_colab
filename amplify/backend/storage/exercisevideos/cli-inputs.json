@@ -1,0 +1,14 @@
+{
+  "resourceName": "exercisevideos",
+  "policyUUID": "f6f83592",
+  "bucketName": "fitperfect-exercisevideos-dev",
+  "storageAccess": "auth",
+  "guestAccess": [],
+  "authAccess": [
+    "CREATE_AND_UPDATE",
+    "READ",
+    "DELETE"
+  ],
+  "triggerFunction": "NONE",
+  "groupAccess": {}
+}

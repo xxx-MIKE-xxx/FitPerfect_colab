@@ -1,0 +1,4 @@
+# l10n.yaml ─ configuration for Flutter’s gen-l10n tool
+arb-dir: lib/l10n               # folder that holds all .arb files
+template-arb-file: app_en.arb   # the “source” (English) ARB
+output-localization-file: app_localizations.dart

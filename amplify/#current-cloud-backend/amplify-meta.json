@@ -1,0 +1,79 @@
+{
+  "providers": {
+    "awscloudformation": {
+      "AuthRoleName": "amplify-fitperfect-dev-ed5ec-authRole",
+      "UnauthRoleArn": "arn:aws:iam::525179705615:role/amplify-fitperfect-dev-ed5ec-unauthRole",
+      "AuthRoleArn": "arn:aws:iam::525179705615:role/amplify-fitperfect-dev-ed5ec-authRole",
+      "Region": "eu-central-1",
+      "DeploymentBucketName": "amplify-fitperfect-dev-ed5ec-deployment",
+      "UnauthRoleName": "amplify-fitperfect-dev-ed5ec-unauthRole",
+      "StackName": "amplify-fitperfect-dev-ed5ec",
+      "StackId": "arn:aws:cloudformation:eu-central-1:525179705615:stack/amplify-fitperfect-dev-ed5ec/15825e60-33e8-11f0-a149-0aeea7571a49",
+      "AmplifyAppId": "d2f6nijrfx17hk"
+    }
+  },
+  "auth": {
+    "fitperfect108762a3": {
+      "customAuth": false,
+      "dependsOn": [],
+      "frontendAuthConfig": {
+        "mfaConfiguration": "OFF",
+        "mfaTypes": [
+          "SMS"
+        ],
+        "passwordProtectionSettings": {
+          "passwordPolicyMinLength": 8,
+          "passwordPolicyCharacters": []
+        },
+        "signupAttributes": [
+          "EMAIL"
+        ],
+        "socialProviders": [
+          "FACEBOOK",
+          "GOOGLE"
+        ],
+        "usernameAttributes": [
+          "EMAIL"
+        ],
+        "verificationMechanisms": [
+          "EMAIL"
+        ]
+      },
+      "providerPlugin": "awscloudformation",
+      "service": "Cognito",
+      "output": {
+        "UserPoolId": "eu-central-1_boU4KUcaB",
+        "AppClientIDWeb": "1ldcbhnlkd4668qb8810olflka",
+        "AppClientID": "2jarpfv6l69pf3reotj11fcl2m",
+        "HostedUIDomain": "fitperfect69642e95-69642e95-dev",
+        "IdentityPoolId": "eu-central-1:2d3abfab-d5c6-4ab6-b2d7-47311a699e42",
+        "UserPoolArn": "arn:aws:cognito-idp:eu-central-1:525179705615:userpool/eu-central-1_boU4KUcaB",
+        "IdentityPoolName": "fitperfect108762a3_identitypool_108762a3__dev",
+        "OAuthMetadata": "{\"AllowedOAuthFlows\":[\"code\"],\"AllowedOAuthScopes\":[\"phone\",\"email\",\"openid\",\"profile\",\"aws.cognito.signin.user.admin\"],\"CallbackURLs\":[\"com.fitperfect://auth/\"],\"LogoutURLs\":[\"com.fitperfect://signout/\"]}",
+        "UserPoolName": "fitperfect108762a3_userpool_108762a3"
+      },
+      "lastPushTimeStamp": "2025-05-21T19:59:41.745Z",
+      "providerMetadata": {
+        "s3TemplateURL": "https://s3.amazonaws.com/amplify-fitperfect-dev-ed5ec-deployment/amplify-cfn-templates/auth/fitperfect108762a3-cloudformation-template.json",
+        "logicalId": "authfitperfect108762a3"
+      },
+      "lastPushDirHash": "lCQyeGyQWkTCVvpzXBqRt1C6FXA="
+    }
+  },
+  "storage": {
+    "exercisevideos": {
+      "dependsOn": [],
+      "providerPlugin": "awscloudformation",
+      "service": "S3",
+      "output": {
+        "BucketName": "fitperfect-exercisevideos-deved5ec-dev",
+        "Region": "eu-central-1"
+      },
+      "lastPushTimeStamp": "2025-05-21T19:59:41.335Z",
+      "providerMetadata": {
+        "s3TemplateURL": "https://s3.amazonaws.com/amplify-fitperfect-dev-ed5ec-deployment/amplify-cfn-templates/storage/cloudformation-template.json",
+        "logicalId": "storageexercisevideos"
+      }
+    }
+  }
+}

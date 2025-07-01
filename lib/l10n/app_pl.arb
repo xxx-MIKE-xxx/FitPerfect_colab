@@ -1,0 +1,28 @@
+{
+    "@@locale": "pl",
+  
+    "general": "Ogólne",
+    "editProfile": "Edytuj profil",
+    "notifications": "Powiadomienia",
+    "languageUnits": "Język i jednostki",
+  
+    "recordingAnalysis": "Nagrywanie i analiza",
+    "videoQuality": "Jakość wideo",
+    "aiSensitivity": "Czułość AI",
+    "saveAutoDelete": "Zapis i auto-usuwanie wideo",
+  
+    "dataProgress": "Dane i postępy",
+    "trainingHistory": "Historia treningów",
+    "exportData": "Eksport danych",
+    "syncFitness": "Synchronizuj z aplikacją fitness",
+  
+    "privacySecurity": "Prywatność i bezpieczeństwo",
+    "privacyControls": "Ustawienia prywatności",
+    "accountSecurity": "Konto i bezpieczeństwo",
+  
+    "logout": "Wyloguj",
+    "progressTab": "Postępy",
+    "exercisesTab": "Ćwiczenia",
+    "profileTab": "Profil"
+  }
+  

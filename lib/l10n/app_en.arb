@@ -1,0 +1,43 @@
+{
+    "@@locale": "en",
+  
+    "editProfile": "Edit profile",
+    "notifications": "Notifications",
+    "languageUnits": "Language & units",
+  
+    "language": "Language",          
+    "units": "Units",              
+    "videoQuality": "Video quality",
+    "aiSensitivity": "AI sensitivity",
+    "saveAutoDelete": "Save & auto-delete videos",
+    "trainingHistory": "Training history",
+    "exportData": "Export data",
+    "syncFitness": "Sync with fitness app",
+    "privacyControls": "Privacy controls",
+    "accountSecurity": "Account & security",
+    "logout": "Logout",
+    "general": "General",                
+    "recordingAnalysis": "Recording & analysis", 
+    "dataProgress": "Data & progress",   
+    "privacySecurity": "Privacy & security", 
+
+    "progressTab": "Progress",           
+    "exercisesTab": "Exercises",        
+    "profileTab": "Profile",
+    "progressTab": "Progress",
+    "exercisesTab": "Exercises",
+    "profileTab": "Profile"  ,
+    "searchExercises": "Search exercises…",
+
+    "plank":          "Plank",
+    "burpee":         "Burpee",
+    "bicepCurl":      "Bicep Curl",
+    "tricepDip":      "Tricep Dip",
+    "mountainClimber":"Mountain Climber",
+    "row":            "Row",
+    "legPress":       "Leg Press",
+    "crunch":         "Crunch",
+    "hipThrust":      "Hip Thrust",
+    "calfRaise":      "Calf Raise"     
+  }
+  
