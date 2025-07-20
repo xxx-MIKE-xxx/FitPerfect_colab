@@ -6,7 +6,7 @@ import 'package:google_fonts/google_fonts.dart';
 
 import 'package:flutter_gen/gen_l10n/app_localizations.dart';
 import 'router.dart';                       // your GoRouter tree
-import 'ui/auth_gate.dart';
+import 'features/auth/login_page.dart';
 import 'shared/providers/auth_provider.dart';
 import 'shared/providers/locale_notifier.dart';   // step 6
 
@@ -56,6 +56,7 @@ class _BootstrapperState extends ConsumerState<_Bootstrapper> {
   @override
   Widget build(BuildContext context) {
     final locale = ref.watch(localeNotifierProvider).locale;
+    final auth   = ref.watch(authProvider);
 
     final baseTheme = ThemeData(
       useMaterial3: true,
@@ -63,9 +64,42 @@ class _BootstrapperState extends ConsumerState<_Bootstrapper> {
       textTheme: GoogleFonts.poppinsTextTheme(),
     );
 
-    final app = MaterialApp.router(
+    if (!_ampReady || auth.status == AuthStatus.unknown) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: baseTheme,
+        locale: locale,
+        supportedLocales: AppLocalizations.supportedLocales,
+        localizationsDelegates: const [
+          AppLocalizations.delegate,
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+        home: const Scaffold(
+          body: Center(child: CircularProgressIndicator()),
+        ),
+      );
+    }
+
+    if (auth.status == AuthStatus.authenticated) {
+      return MaterialApp.router(
+        debugShowCheckedModeBanner: false,
+        routerConfig: createRouter(),
+        theme: baseTheme,
+        locale: locale,
+        supportedLocales: AppLocalizations.supportedLocales,
+        localizationsDelegates: const [
+          AppLocalizations.delegate,
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+      );
+    }
+
+    return MaterialApp(
       debugShowCheckedModeBanner: false,
-      routerConfig: createRouter(),             // your existing GoRouter factory
       theme: baseTheme,
       locale: locale,
       supportedLocales: AppLocalizations.supportedLocales,
@@ -75,25 +109,7 @@ class _BootstrapperState extends ConsumerState<_Bootstrapper> {
         GlobalWidgetsLocalizations.delegate,
         GlobalCupertinoLocalizations.delegate,
       ],
+      home: const LoginPage(),
     );
-
-    // While Amplify is starting up, show a simple loading shell.
-    return _ampReady
-        ? app
-        : MaterialApp(
-            debugShowCheckedModeBanner: false,
-            theme: baseTheme,
-            locale: locale,
-            supportedLocales: AppLocalizations.supportedLocales,
-            localizationsDelegates: const [
-              AppLocalizations.delegate,
-              GlobalMaterialLocalizations.delegate,
-              GlobalWidgetsLocalizations.delegate,
-              GlobalCupertinoLocalizations.delegate,
-            ],
-            home: const Scaffold(
-              body: Center(child: CircularProgressIndicator()),
-            ),
-          );
   }
 }
