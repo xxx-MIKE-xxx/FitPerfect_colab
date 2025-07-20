@@ -11,14 +11,14 @@ class _SocialButton extends StatelessWidget {
   const _SocialButton({
     required this.text,
     required this.color,
-    required this.onTap,
+    this.onTap,
     this.textColor,
   });
 
   final String text;
   final Color color;
   final Color? textColor;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) => SizedBox(
@@ -80,6 +80,12 @@ class _EmailPasswordFormState extends ConsumerState<_EmailPasswordForm> {
   bool _busy = false;
   bool _signUpMode = false;
 
+  Future<void> _signInWith(AuthProvider provider) async {
+    setState(() => _busy = true);
+    await ref.read(authProvider.notifier).signInWithProvider(provider);
+    if (mounted) setState(() => _busy = false);
+  }
+
   Future<void> _submit() async {
     if (!_form.currentState!.validate()) return;
 
@@ -132,17 +138,13 @@ class _EmailPasswordFormState extends ConsumerState<_EmailPasswordForm> {
                   text: 'Continue with Google',
                   color: Colors.white,
                   textColor: Colors.black87,
-                  onTap: () => ref
-                      .read(authProvider.notifier)
-                      .signInWithProvider(AuthProvider.google),
+                  onTap: _busy ? null : () => _signInWith(AuthProvider.google),
                 ),
                 const SizedBox(height: 12),
                 _SocialButton(
                   text: 'Continue with Facebook',
                   color: const Color(0xFF1877F2),
-                  onTap: () => ref
-                      .read(authProvider.notifier)
-                      .signInWithProvider(AuthProvider.facebook),
+                  onTap: _busy ? null : () => _signInWith(AuthProvider.facebook),
                 ),
 
                 const SizedBox(height: 24),
