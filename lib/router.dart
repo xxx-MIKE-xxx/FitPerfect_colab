@@ -50,6 +50,7 @@ final router = GoRouter(
           redirect: (_, __) => '/exercises',
         ),
         
+
         GoRoute(
           path: '/settings/edit-profile',
           name: 'edit-profile',
@@ -101,12 +102,14 @@ final router = GoRouter(
           builder: (ctx, state) {
             final extra   = state.extra! as Map<String, dynamic>;
             return FeedbackScreen(
-              videoPath: extra['videoPath'] as String?,
-              videoKey : extra['videoKey'] as String?,
+              videoKey : extra['videoKey'] as String,
               report   : extra['report']   as Map<String, dynamic>,
             );
           },
         ),
+
+
+
       ],
     ),
   ],
