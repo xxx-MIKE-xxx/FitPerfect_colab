@@ -120,8 +120,12 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   Future<void> signInWithProvider(AuthProvider provider) async {
     try {
-      await Amplify.Auth.signInWithWebUI(provider: provider);
-      state = const AuthState.authenticated();
+      final res = await Amplify.Auth.signInWithWebUI(provider: provider);
+      if (res.isSignedIn) {
+        state = const AuthState.authenticated();
+      } else {
+        await _checkLoginStatus();
+      }
     } on AuthException catch (e) {
       state = AuthState.error(e.message);
     }
