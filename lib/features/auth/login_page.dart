@@ -11,14 +11,14 @@ class _SocialButton extends StatelessWidget {
   const _SocialButton({
     required this.text,
     required this.color,
-    required this.onTap,
+    this.onTap,
     this.textColor,
   });
 
   final String text;
   final Color color;
   final Color? textColor;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) => SizedBox(
