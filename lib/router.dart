@@ -112,6 +112,10 @@ final router = GoRouter(
 
       ],
     ),
+    GoRoute(
+      path: '/login',
+      builder: (_, __) => const LoginPage(),
+    ),
   ],
 );
 
