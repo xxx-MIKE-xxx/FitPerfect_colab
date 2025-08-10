@@ -188,6 +188,31 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     );
   }
 
+  /* ────────────── seek helpers ───────────── */
+
+  Duration _durationForFrame(int frame) =>
+      Duration(milliseconds: (frame / _assumedFps * 1000).round());
+
+  void _seekPrevMistake() {
+    if (_events.isEmpty) return;
+    final curFrame = (_vc.value.position.inMilliseconds / 1000.0 * _assumedFps).round();
+    final prev = _events.lastWhere(
+      (e) => e.frame < curFrame,
+      orElse: () => _events.first,
+    );
+    _vc.seekTo(_durationForFrame(prev.frame));
+  }
+
+  void _seekNextMistake() {
+    if (_events.isEmpty) return;
+    final curFrame = (_vc.value.position.inMilliseconds / 1000.0 * _assumedFps).round();
+    final next = _events.firstWhere(
+      (e) => e.frame > curFrame,
+      orElse: () => _events.last,
+    );
+    _vc.seekTo(_durationForFrame(next.frame));
+  }
+
   /* ───────────────────────────── UI ───────────────────────────── */
 
   @override
@@ -244,6 +269,11 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
               child: Row(
                 children: [
                   IconButton(
+                    tooltip: 'Previous mistake',
+                    icon: const Icon(Icons.skip_previous),
+                    onPressed: _seekPrevMistake,
+                  ),
+                  IconButton(
                     iconSize: 32,
                     icon: Icon(
                       _vc.value.isPlaying
@@ -267,6 +297,12 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
                       ),
                     ),
                   ),
+                  IconButton(
+                    tooltip: 'Next mistake',
+                    icon: const Icon(Icons.skip_next),
+                    onPressed: _seekNextMistake,
+                  ),
+                  const SizedBox(width: 4),
                   Text(
                     '${_fmt(position)} / ${_fmt(duration)}',
                     style: Theme.of(context).textTheme.labelSmall,

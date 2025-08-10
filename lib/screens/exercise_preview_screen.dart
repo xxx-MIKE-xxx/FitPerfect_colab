@@ -1,5 +1,6 @@
 // lib/screens/exercise_preview_screen.dart
 // ─────────────────────────────────────────────────────────────────────────────
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -34,14 +35,14 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
   final _picker   = ImagePicker();
 
   /* ───────────── progress helper ───────────── */
-  Future<void> _showProcessingDialog() async {
+  Future<void> _showProcessingDialog(VoidCallback onSkip) async {
     debugPrint('[ExercisePreview] showing “Analyzing…” dialog');
     await showDialog(
       context: context,
       barrierDismissible: false,
       useRootNavigator: false,
-      builder: (_) => const AlertDialog(
-        content: Row(
+      builder: (_) => AlertDialog(
+        content: const Row(
           children: [
             SizedBox(
               width: 28,
@@ -52,6 +53,12 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
             Expanded(child: Text('Analyzing your video…')),
           ],
         ),
+        actions: [
+          TextButton(
+            onPressed: onSkip,
+            child: const Text('Show replay'),
+          ),
+        ],
       ),
     );
   }
@@ -110,21 +117,33 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
 
     /* D. 🔄  polling for report ───────────────────────────────────── */
     try {
-      _showProcessingDialog();                       // fire-and-forget
+      final skipCompleter = Completer<Map<String, dynamic>>();
+      _showProcessingDialog(() {
+        _hideProcessingDialog();
+        if (!skipCompleter.isCompleted) skipCompleter.complete({});
+      });
 
-      final report = await ApiClient.fetchReport(
-        s3Path,
-        delay: const Duration(seconds: 6),
-        max: 120,
-      );
+      final report = await Future.any([
+        ApiClient.fetchReport(
+          s3Path,
+          delay: const Duration(seconds: 6),
+          max: 120,
+        ),
+        skipCompleter.future,
+      ]);
 
       _hideProcessingDialog();
-      debugPrint('✅ report downloaded for $s3Path');
 
-      _navigateToFeedback(localPath, s3Path, report);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('🎉 Analysis finished')),
-      );
+      if (skipCompleter.isCompleted) {
+        debugPrint('[ExercisePreview] bypassing processing – showing replay');
+        _navigateToFeedback(localPath, s3Path, {});
+      } else {
+        debugPrint('✅ report downloaded for $s3Path');
+        _navigateToFeedback(localPath, s3Path, report);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('🎉 Analysis finished')),
+        );
+      }
     } catch (e) {
       _hideProcessingDialog();
       debugPrint('[ExercisePreview] fetchReport failed → $e');
