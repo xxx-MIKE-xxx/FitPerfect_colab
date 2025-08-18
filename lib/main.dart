@@ -19,7 +19,7 @@ import 'amplifyconfiguration.dart';
 
 Future<void> _configureAmplify(WidgetRef ref) async {
   if (Amplify.isConfigured) return;
-
+  AWSLogger().logLevel = LogLevel.verbose; // <— add this
   await Amplify.addPlugins([
     AmplifyAuthCognito(),
     AmplifyStorageS3(),

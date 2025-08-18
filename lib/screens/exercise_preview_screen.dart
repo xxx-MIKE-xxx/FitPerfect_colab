@@ -33,6 +33,9 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
   bool _recording = false;
   final _picker   = ImagePicker();
 
+  // remember the last captured/selected video so the user can choose what to do
+  File? _lastVideo;
+
   /* ───────────── progress helper ───────────── */
   Future<void> _showProcessingDialog() async {
     debugPrint('[ExercisePreview] showing “Analyzing…” dialog');
@@ -67,6 +70,27 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
   Future<File?> pickVideoFromGallery() async {
     final xFile = await _picker.pickVideo(source: ImageSource.gallery);
     return xFile == null ? null : File(xFile.path);
+  }
+
+  // Save a stable local copy and remember it for later actions.
+  Future<void> _rememberVideo(File videoFile) async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final ts  = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
+      final dst = File('${dir.path}/local_${widget.exerciseId}_$ts.mp4');
+      final saved = await videoFile.copy(dst.path);
+      setState(() => _lastVideo = saved);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Video ready • ${saved.path.split('/').last}')),
+        );
+      }
+      debugPrint('[ExercisePreview] local saved copy → ${saved.path}');
+    } catch (e) {
+      // Fall back to temp file if copy fails.
+      setState(() => _lastVideo = videoFile);
+      debugPrint('[ExercisePreview] could not save local copy: $e');
+    }
   }
 
   /* ───────────── UPLOAD & PROCESS ───────────── */
@@ -122,9 +146,11 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
       debugPrint('✅ report downloaded for $s3Path');
 
       _navigateToFeedback(localPath, s3Path, report);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('🎉 Analysis finished')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('🎉 Analysis finished')),
+        );
+      }
     } catch (e) {
       _hideProcessingDialog();
       debugPrint('[ExercisePreview] fetchReport failed → $e');
@@ -171,6 +197,23 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
     }
   }
 
+  // bypass helper (no upload, no auth)
+  void _bypassToFeedback() {
+    final file = _lastVideo;
+    if (file == null) return;
+    final placeholderKey =
+        'local/${widget.exerciseId}/${DateTime.now().millisecondsSinceEpoch}.mp4';
+    _navigateToFeedback(file.path, placeholderKey, const {'data': []});
+  }
+
+  // user-triggered analysis
+  Future<void> _analyzeNow() async {
+    final file = _lastVideo;
+    if (file == null) return;
+    if (!await _ensureSignedIn()) return;
+    await _uploadAndProcess(file);
+  }
+
   /* ─────────────────── CAMERA ─────────────────── */
   @override
   void initState() {
@@ -204,58 +247,84 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
     final theme = Theme.of(context);
 
     return Scaffold(
+      backgroundColor: const Color(0xFFF7F9FB),
       appBar: AppBar(
-        title: Text(widget.exerciseId.capitalize()),
+        elevation: 0,
+        backgroundColor: const Color(0xFFF7F9FB),
+        title: Row(
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: const LinearGradient(
+                  colors: [Color(0xFFFFC107), Color(0xFFFF7043)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+              ),
+              child: Icon(_iconFor(widget.exerciseId), color: Colors.white),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              widget.exerciseId.capitalize(),
+              style: theme.textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.w800,
+                letterSpacing: -.2,
+              ),
+            ),
+          ],
+        ),
         leading: const BackButton(),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 16),
-            child: Icon(_iconFor(widget.exerciseId)),
-          ),
-        ],
       ),
       body: Column(
         children: [
+          // Camera preview
           Expanded(
             child: _ready
-                ? FittedBox(
-                    fit: BoxFit.cover,
-                    child: SizedBox(
-                      width : _cam.value.previewSize!.height,
-                      height: _cam.value.previewSize!.width,
-                      child : CameraPreview(_cam),
-                    ),
+                ? Stack(
+                    children: [
+                      // Keep the same orientation-preserving preview
+                      FittedBox(
+                        fit: BoxFit.cover,
+                        child: SizedBox(
+                          width : _cam.value.previewSize!.height,
+                          height: _cam.value.previewSize!.width,
+                          child : CameraPreview(_cam),
+                        ),
+                      ),
+                      // Status chip
+                      Positioned(
+                        top: 12,
+                        right: 12,
+                        child: _StatusChip(
+                          recording: _recording,
+                          videoReady: _lastVideo != null,
+                        ),
+                      ),
+                    ],
                   )
                 : const Center(child: CircularProgressIndicator()),
           ),
-          // ─ buttons ────────────────────────────────────────────
-          Padding(
-            padding: const EdgeInsets.fromLTRB(32, 24, 32, 40),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                FilledButton(
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(54),
-                    backgroundColor:
-                        _recording ? Colors.red : theme.colorScheme.primary,
-                  ),
-                  onPressed: _ready ? _toggleRecording : null,
-                  child: Text(_recording ? 'Stop recording'
-                                        : 'Start recording'),
-                ),
-                const SizedBox(height: 12),
-                FilledButton.tonalIcon(
-                  icon : const Icon(Icons.video_library),
-                  label: const Text('Choose existing video'),
-                  onPressed: () async {
-                    final file = await pickVideoFromGallery();
-                    if (file == null) return;
-                    if (!await _ensureSignedIn()) return;
-                    await _uploadAndProcess(file);
-                  },
-                ),
-              ],
+
+          // Action panel (visual revamp, same actions)
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+              child: _ActionPanel(
+                recording: _recording,
+                hasVideo: _lastVideo != null,
+                onToggleRecord: _ready ? _toggleRecording : null,
+                onPickVideo: () async {
+                  final file = await pickVideoFromGallery();
+                  if (file == null) return;
+                  await _rememberVideo(file);   // ← just remember; no upload
+                },
+                onAnalyze: _analyzeNow,
+                onSkip: _bypassToFeedback,
+              ),
             ),
           ),
         ],
@@ -286,16 +355,16 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
   }
 
   Future<void> _toggleRecording() async {
-    if (!await _ensureSignedIn()) return;
-
     if (_recording) {
       final xFile = await _cam.stopVideoRecording();
       setState(() => _recording = false);
-      await _uploadAndProcess(File(xFile.path));
+      await _rememberVideo(File(xFile.path)); // ← just remember; no upload
+      HapticFeedback.selectionClick();
     } else {
       await _cam.prepareForVideoRecording();
       await _cam.startVideoRecording();
       setState(() => _recording = true);
+      HapticFeedback.heavyImpact();
     }
   }
 
@@ -339,4 +408,216 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
 extension on String {
   String capitalize() =>
       isEmpty ? this : '${this[0].toUpperCase()}${substring(1)}';
+}
+
+/* ───────── UI widgets (visual only) ───────── */
+
+class _StatusChip extends StatelessWidget {
+  const _StatusChip({required this.recording, required this.videoReady});
+  final bool recording;
+  final bool videoReady;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = recording
+        ? Colors.red
+        : (videoReady ? const Color(0xFF00C853) : Colors.black54);
+    final label = recording
+        ? 'Recording…'
+        : (videoReady ? 'Video ready' : 'Ready');
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(.92),
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: const [
+          BoxShadow(color: Color(0x1A000000), blurRadius: 12, offset: Offset(0, 4)),
+        ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 8, height: 8,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 8),
+          Text(label, style: TextStyle(fontWeight: FontWeight.w600, color: Colors.black87)),
+        ],
+      ),
+    );
+  }
+}
+
+class _ActionPanel extends StatelessWidget {
+  const _ActionPanel({
+    required this.recording,
+    required this.hasVideo,
+    required this.onToggleRecord,
+    required this.onPickVideo,
+    required this.onAnalyze,
+    required this.onSkip,
+  });
+
+  final bool recording;
+  final bool hasVideo;
+  final VoidCallback? onToggleRecord;
+  final VoidCallback onPickVideo;
+  final VoidCallback onAnalyze;
+  final VoidCallback onSkip;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Material(
+      elevation: 10,
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(24),
+      shadowColor: Colors.black.withOpacity(.1),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Record / Stop
+            _GradientButton(
+              height: 56,
+              onPressed: onToggleRecord,
+              colors: recording
+                  ? const [Color(0xFFD32F2F), Color(0xFFE53935)]               // intense red while recording
+                  : const [Color(0xFFFFC107), Color(0xFFFF7043)],              // amber → fire red
+              icon: recording ? Icons.stop : Icons.fiber_manual_record,
+              label: recording ? 'Stop recording' : 'Tap to record',
+            ),
+            const SizedBox(height: 10),
+            // Pick from gallery
+            _GhostButton(
+              onPressed: onPickVideo,
+              icon: Icons.video_library_rounded,
+              label: 'Choose existing video',
+            ),
+
+            if (hasVideo) ...[
+              const SizedBox(height: 12),
+              const Divider(height: 1),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: _GradientButton(
+                      height: 52,
+                      onPressed: onAnalyze,
+                      colors: const [Color(0xFF00BFA5), Color(0xFF1DE9B6)],   // teal → mint
+                      icon: Icons.analytics,
+                      label: 'Analyze now',
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _GhostButton(
+                      onPressed: onSkip,
+                      icon: Icons.skip_next,
+                      label: 'Continue without analysis',
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GradientButton extends StatelessWidget {
+  const _GradientButton({
+    required this.onPressed,
+    required this.colors,
+    required this.icon,
+    required this.label,
+    this.height = 54,
+  });
+
+  final VoidCallback? onPressed;
+  final List<Color> colors;
+  final IconData icon;
+  final String label;
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onPressed != null;
+    return Opacity(
+      opacity: enabled ? 1 : .6,
+      child: InkWell(
+        onTap: onPressed,
+        borderRadius: BorderRadius.circular(18),
+        child: Ink(
+          height: height,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(colors: colors),
+            borderRadius: BorderRadius.circular(18),
+            boxShadow: [
+              BoxShadow(
+                color: colors.last.withOpacity(.35),
+                blurRadius: 20,
+                offset: const Offset(0, 8),
+              )
+            ],
+          ),
+          child: Center(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, color: Colors.white),
+                const SizedBox(width: 10),
+                Text(
+                  label,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 16,
+                    letterSpacing: .2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _GhostButton extends StatelessWidget {
+  const _GhostButton({
+    required this.onPressed,
+    required this.icon,
+    required this.label,
+  });
+
+  final VoidCallback onPressed;
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final border = BorderSide(color: Colors.black.withOpacity(.12));
+    return OutlinedButton.icon(
+      style: OutlinedButton.styleFrom(
+        minimumSize: const Size.fromHeight(52),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        side: border,
+        foregroundColor: Colors.black87,
+      ),
+      onPressed: onPressed,
+      icon: Icon(icon),
+      label: Text(
+        label,
+        style: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+    );
+  }
 }

@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
+import 'package:go_router/go_router.dart';
 
 class FeedbackScreen extends StatefulWidget {
   const FeedbackScreen({
@@ -277,7 +278,30 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
           const SizedBox(height: 4),
         ],
       ),
-      // ‼️  No floatingActionButton – save button removed
+      // New: go to Feedback Summary
+      floatingActionButton: FloatingActionButton.extended(
+        icon: const Icon(Icons.summarize),
+        label: const Text('View summary'),
+        onPressed: () {
+          // Try to infer exerciseId from the key shape:
+          // private/videos/<exerciseId>/timestamp.mp4
+          // or local/<exerciseId>/timestamp.mp4 (bypass path)
+          String exerciseId = 'unknown';
+          final key = widget.videoKey ?? '';
+          final parts = key.split('/');
+          if (parts.length >= 3 && parts[0] == 'private' && parts[1] == 'videos') {
+            exerciseId = parts[2];
+          } else if (parts.length >= 2 && parts[0] == 'local') {
+            exerciseId = parts[1];
+          }
+
+          context.push('/feedback-summary', extra: {
+            'exerciseId': exerciseId,
+            's3Key'     : widget.videoKey,
+            'report'    : widget.report, // lets SummaryRepository derive/fixture if server off
+          });
+        },
+      ),
     );
   }
 

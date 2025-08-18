@@ -1,0 +1,26 @@
+{
+    "version": "summary-v1",
+    "exerciseId": "squat",
+    "media": { "s3Key": null, "fps": 30 },
+    "score": 83,
+    "mistakes": [
+      {
+        "code": "depth_angle_low",
+        "title": "Depth angle",
+        "severity": "mild",
+        "detail": "82.5° (target ≥ 85°)",
+        "metrics": { "angle_deg": 82.5 },
+        "ranges": [{ "startFrame": 210, "endFrame": 210 }]
+      },
+      {
+        "code": "hip_shift_left",
+        "title": "Hip shift",
+        "severity": "severe",
+        "detail": "3.25° left tilt",
+        "metrics": { "tilt_deg": -3.25 },
+        "ranges": [{ "startFrame": 280, "endFrame": 312 }]
+      }
+    ],
+    "generatedAt": "2025-01-01T12:00:00Z"
+  }
+  

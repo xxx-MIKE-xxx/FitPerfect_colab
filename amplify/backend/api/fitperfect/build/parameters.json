@@ -1,0 +1,7 @@
+{
+    "AppSyncApiName": "fitperfect",
+    "DynamoDBBillingMode": "PAY_PER_REQUEST",
+    "DynamoDBEnableServerSideEncryption": false,
+    "S3DeploymentBucket": "amplify-fitperfect-dev-ed5ec-deployment",
+    "S3DeploymentRootKey": "amplify-appsync-files/21ca97217868616f618136cc9e1c871abec391a4"
+}
