@@ -65,6 +65,7 @@ flutter:
   generate: true     # enables flutter gen-l10n
 
   assets:
+  - assets/fixtures/
     # Uncomment as you add real assets
     # - assets/icons/
     # - assets/images/

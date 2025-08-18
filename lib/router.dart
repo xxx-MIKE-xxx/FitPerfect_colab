@@ -16,6 +16,8 @@ import 'screens/settings/export_data_screen.dart';
 import 'screens/settings/privacy_controls_screen.dart';
 import 'screens/settings/account_security_screen.dart';
 import 'screens/feedback_screen.dart'; 
+import 'screens/feedback_summary_screen.dart';
+
 
 final router = GoRouter(
   routes: [
@@ -100,10 +102,23 @@ final router = GoRouter(
         GoRoute(
           path: '/feedback',
           builder: (ctx, state) {
-            final extra   = state.extra! as Map<String, dynamic>;
+            final extra = (state.extra as Map<String, dynamic>?) ?? const {};
             return FeedbackScreen(
-              videoKey : extra['videoKey'] as String,
-              report   : extra['report']   as Map<String, dynamic>,
+              videoPath: extra['videoPath'] as String?,
+              videoKey : extra['videoKey']  as String?,
+              report   : (extra['report'] as Map<String, dynamic>?)
+                        ?? const {'data': []}, // empty = no overlays
+            );
+          },
+        ),
+        GoRoute(
+          path: '/feedback-summary',
+          builder: (ctx, state) {
+            final extra = (state.extra as Map<String, dynamic>?) ?? const {};
+            return FeedbackSummaryScreen(
+              exerciseId : extra['exerciseId'] as String,
+              s3Key      : extra['s3Key'] as String?,
+              localReport: extra['report'] as Map<String, dynamic>?,
             );
           },
         ),

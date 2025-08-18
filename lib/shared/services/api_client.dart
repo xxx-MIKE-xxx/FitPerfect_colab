@@ -41,6 +41,39 @@ class ApiClient {
   }
 
 
+
+    /// One-shot summary endpoint (server returns the same "summary-v1" shape).
+    /// One-shot summary endpoint (server returns the same "summary-v1" shape).
+  static Future<Map<String, dynamic>> fetchSummary(String s3Key) async {
+    final url = Uri.parse('$_base/api/v1/videos/${Uri.encodeComponent(s3Key)}/summary');
+
+    // Always send a fresh token
+    final jwt = await _freshJwt();
+
+    final client = http.Client();
+    try {
+      final resp = await client
+          .get(url, headers: {'Authorization': 'Bearer $jwt'})
+          .timeout(const Duration(seconds: 6)); // ← IMPORTANT
+
+      if (resp.statusCode == 200) {
+        return jsonDecode(resp.body) as Map<String, dynamic>;
+      }
+
+      throw HttpException(
+        'Summary not ready (HTTP ${resp.statusCode}): ${resp.body}',
+        uri: url,
+      );
+    } on TimeoutException {
+      throw TimeoutException('Summary request timed out');
+    } finally {
+      client.close();
+    }
+  }
+
+
+
+
   /* ───────────── MAIN API ───────────── */
 
   /// Polls `/api/v1/videos/<s3-key>/result` until it returns **200** with
