@@ -1,23 +1,26 @@
+// ─────────────────────────────────────────────────────────────────────────────
 // lib/screens/exercise_preview_screen.dart
+// Records video, lets you ANALYZE (offline on-device) and saves keypoints JSON.
 // ─────────────────────────────────────────────────────────────────────────────
 import 'dart:convert';
 import 'dart:io';
 
-import '../shared/services/api_client.dart';
-import 'package:amplify_flutter/amplify_flutter.dart' as amp;
 import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
+import 'package:amplify_flutter/amplify_flutter.dart' as amp;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
-import 'package:http/http.dart' as http;
-import 'package:intl/intl.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:path_provider/path_provider.dart';            // ← local save
+import 'package:intl/intl.dart';
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import '../shared/services/api_client.dart';
+import '../shared/services/pose_runtime.dart';      // offline pipeline
 import '../shared/services/s3_uploader.dart';
-import '../shared/services/video_transcoder.dart';            // ← NEW
-// ─────────────────────────────────────────────────────────────────────────────
+import '../shared/services/video_transcoder.dart'; // 10fps helper
 
 class ExercisePreviewScreen extends StatefulWidget {
   const ExercisePreviewScreen({super.key, required this.exerciseId});
@@ -29,16 +32,14 @@ class ExercisePreviewScreen extends StatefulWidget {
 
 class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
   late final CameraController _cam;
-  bool _ready     = false;
+  bool _ready = false;
   bool _recording = false;
-  final _picker   = ImagePicker();
+  final _picker = ImagePicker();
 
-  // remember the last captured/selected video so the user can choose what to do
-  File? _lastVideo;
+  File? _lastVideo; // last recorded or picked video
 
   /* ───────────── progress helper ───────────── */
   Future<void> _showProcessingDialog() async {
-    debugPrint('[ExercisePreview] showing “Analyzing…” dialog');
     await showDialog(
       context: context,
       barrierDismissible: false,
@@ -46,11 +47,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
       builder: (_) => const AlertDialog(
         content: Row(
           children: [
-            SizedBox(
-              width: 28,
-              height: 28,
-              child: CircularProgressIndicator(strokeWidth: 3),
-            ),
+            SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 3)),
             SizedBox(width: 24),
             Expanded(child: Text('Analyzing your video…')),
           ],
@@ -60,10 +57,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
   }
 
   void _hideProcessingDialog() {
-    while (Navigator.of(context).canPop()) {
-      Navigator.of(context).pop();
-    }
-    debugPrint('[ExercisePreview] processing dialog closed');
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: false).popUntil((route) => route is! PopupRoute);
   }
   // ────────────────────────────────────────────
 
@@ -72,7 +67,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
     return xFile == null ? null : File(xFile.path);
   }
 
-  // Save a stable local copy and remember it for later actions.
   Future<void> _rememberVideo(File videoFile) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
@@ -85,82 +79,115 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
           SnackBar(content: Text('Video ready • ${saved.path.split('/').last}')),
         );
       }
-      debugPrint('[ExercisePreview] local saved copy → ${saved.path}');
-    } catch (e) {
-      // Fall back to temp file if copy fails.
-      setState(() => _lastVideo = videoFile);
-      debugPrint('[ExercisePreview] could not save local copy: $e');
+    } catch (_) {
+      setState(() => _lastVideo = videoFile); // fall back
     }
   }
 
-  /* ───────────── UPLOAD & PROCESS ───────────── */
+  /// Write a JSON report to disk. Returns the file path.
+  Future<String> _saveLocalReport(Map<String, dynamic> report) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final folder = Directory('${dir.path}/reports/${widget.exerciseId}');
+    await folder.create(recursive: true);
+    final ts = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
+    final file = File('${folder.path}/$ts.json');
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(report));
+    return file.path;
+  }
+
+  Future<void> _analyzeOffline() async {
+    final file = _lastVideo;
+    if (file == null) return;
+
+    try {
+      _showProcessingDialog();
+      final pipeline = PosePipeline();
+      final res = await pipeline.analyzeVideo(file);
+
+      final report = res.toReport();                  // now contains kpts
+      final savedPath = await _saveLocalReport(report);
+      _hideProcessingDialog();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('✅ Saved keypoints → ${savedPath.split('/').last}')),
+        );
+      }
+
+      // Reuse your feedback flow; pass local report + local video
+      _navigateToFeedback(
+        file.path,
+        'local/${widget.exerciseId}/${DateTime.now().millisecondsSinceEpoch}.mp4',
+        report,
+      );
+    } catch (e) {
+      _hideProcessingDialog();
+      debugPrint('[ExercisePreview] offline analyze failed → $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Offline analysis failed: $e')),
+      );
+    }
+  }
+
+  /* ───────────── UPLOAD & PROCESS (cloud fallback) ───────────── */
   Future<void> _uploadAndProcess(File videoFile) async {
     final ts     = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
     final s3Path = 'private/videos/${widget.exerciseId}/$ts.mp4';
 
-    /* A. 💾 persist local copy ──────────────────────────────────────── */
+    // A. local copy (for playback)
     String localPath = videoFile.path;
     try {
       final dir   = await getApplicationDocumentsDirectory();
       final name  = s3Path.replaceAll('/', '_');
       final saved = await videoFile.copy('${dir.path}/$name');
       localPath   = saved.path;
-      debugPrint('[ExercisePreview] local copy → $localPath');
-    } catch (e) {
-      debugPrint('[ExercisePreview] could not save video locally: $e');
-    }
+    } catch (_) {}
 
-    /* NEW: 🔄 make 10-fps surrogate ────────────────────────────────── */
+    // B. make 10-fps surrogate for bandwidth
     late File uploadFile;
     try {
       uploadFile = await VideoTranscoder.to10Fps(videoFile);
-      debugPrint('[ExercisePreview] 10-fps copy → ${uploadFile.path}');
     } catch (e) {
-      debugPrint('[ExercisePreview] transcode failed → $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not convert video to 10 fps')),
+          SnackBar(content: Text('Could not convert to 10 fps: $e')),
         );
       }
       return;
     }
 
-    /* B. ⬆️  S3 upload ─────────────────────────────────────────────── */
-    final presignedUrl = await S3Uploader.upload(uploadFile, s3Path); // ← uploadFile
-    debugPrint('[ExercisePreview] S3 upload done');
+    // C. upload
+    final presignedUrl = await S3Uploader.upload(uploadFile, s3Path);
 
-    /* C. ☁️  notify backend ───────────────────────────────────────── */
+    // D. notify backend
     await _notifyBackend(s3Path);
 
-    /* D. 🔄  polling for report ───────────────────────────────────── */
+    // E. poll for report
     try {
-      _showProcessingDialog();                       // fire-and-forget
-
+      _showProcessingDialog();
       final report = await ApiClient.fetchReport(
         s3Path,
         delay: const Duration(seconds: 6),
         max: 120,
       );
-
       _hideProcessingDialog();
-      debugPrint('✅ report downloaded for $s3Path');
 
       _navigateToFeedback(localPath, s3Path, report);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('🎉 Analysis finished')),
+          const SnackBar(content: Text('🎉 Cloud analysis finished')),
         );
       }
     } catch (e) {
       _hideProcessingDialog();
-      debugPrint('[ExercisePreview] fetchReport failed → $e');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Could not fetch report – $e')),
       );
     }
 
-    // optional toast with presigned URL
+    // Optional toast with URL
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -181,37 +208,14 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
     Map<String, dynamic> report,
   ) {
     if (!mounted) return;
-
-    debugPrint('[ExercisePreview] navigating to /feedback …');
-    try {
-      context.go(
-        '/feedback',
-        extra: {
-          'videoPath': videoPath,
-          'videoKey' : s3Path,
-          'report'   : report,
-        },
-      );
-    } catch (e) {
-      debugPrint('[ExercisePreview] navigation error: $e');
-    }
-  }
-
-  // bypass helper (no upload, no auth)
-  void _bypassToFeedback() {
-    final file = _lastVideo;
-    if (file == null) return;
-    final placeholderKey =
-        'local/${widget.exerciseId}/${DateTime.now().millisecondsSinceEpoch}.mp4';
-    _navigateToFeedback(file.path, placeholderKey, const {'data': []});
-  }
-
-  // user-triggered analysis
-  Future<void> _analyzeNow() async {
-    final file = _lastVideo;
-    if (file == null) return;
-    if (!await _ensureSignedIn()) return;
-    await _uploadAndProcess(file);
+    context.go(
+      '/feedback',
+      extra: {
+        'videoPath': videoPath,
+        'videoKey' : s3Path,
+        'report'   : report,
+      },
+    );
   }
 
   /* ─────────────────── CAMERA ─────────────────── */
@@ -228,10 +232,15 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
       orElse: () => cams.first,
     );
 
-    _cam = CameraController(rear, ResolutionPreset.high, enableAudio: true);
+    _cam = CameraController(
+      rear,
+      ResolutionPreset.high,
+      enableAudio: true,
+      // No image streaming now, so format doesn’t matter
+    );
+
     await _cam.initialize();
     await _cam.lockCaptureOrientation(DeviceOrientation.portraitUp);
-
     if (mounted) setState(() => _ready = true);
   }
 
@@ -256,9 +265,9 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
             Container(
               width: 36,
               height: 36,
-              decoration: BoxDecoration(
+              decoration: const BoxDecoration(
                 shape: BoxShape.circle,
-                gradient: const LinearGradient(
+                gradient: LinearGradient(
                   colors: [Color(0xFFFFC107), Color(0xFFFF7043)],
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight,
@@ -283,32 +292,18 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
           // Camera preview
           Expanded(
             child: _ready
-                ? Stack(
-                    children: [
-                      // Keep the same orientation-preserving preview
-                      FittedBox(
-                        fit: BoxFit.cover,
-                        child: SizedBox(
-                          width : _cam.value.previewSize!.height,
-                          height: _cam.value.previewSize!.width,
-                          child : CameraPreview(_cam),
-                        ),
-                      ),
-                      // Status chip
-                      Positioned(
-                        top: 12,
-                        right: 12,
-                        child: _StatusChip(
-                          recording: _recording,
-                          videoReady: _lastVideo != null,
-                        ),
-                      ),
-                    ],
+                ? FittedBox(
+                    fit: BoxFit.cover,
+                    child: SizedBox(
+                      width : _cam.value.previewSize!.height,
+                      height: _cam.value.previewSize!.width,
+                      child : CameraPreview(_cam),
+                    ),
                   )
                 : const Center(child: CircularProgressIndicator()),
           ),
 
-          // Action panel (visual revamp, same actions)
+          // Action panel
           SafeArea(
             top: false,
             child: Padding(
@@ -320,10 +315,13 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
                 onPickVideo: () async {
                   final file = await pickVideoFromGallery();
                   if (file == null) return;
-                  await _rememberVideo(file);   // ← just remember; no upload
+                  await _rememberVideo(file);
                 },
-                onAnalyze: _analyzeNow,
-                onSkip: _bypassToFeedback,
+                onAnalyze: _analyzeOffline,
+                onAnalyzeCloud: () async {
+                  final f = _lastVideo;
+                  if (f != null) await _uploadAndProcess(f);
+                },
               ),
             ),
           ),
@@ -332,33 +330,11 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
     );
   }
 
-  /* ─────────────────── HELPERS ─────────────────── */
-  Future<bool> _ensureSignedIn() async {
-    try {
-      if ((await amp.Amplify.Auth.fetchAuthSession()).isSignedIn) return true;
-    } on amp.AuthException catch (e) {
-      amp.safePrint('‼︎ Auth check failed → $e');
-    }
-
-    if (!mounted) return false;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Please sign-in to upload workouts')),
-    );
-
-    await context.push('/login');
-    try {
-      return (await amp.Amplify.Auth.fetchAuthSession()).isSignedIn;
-    } catch (_) {
-      return false;
-    }
-  }
-
   Future<void> _toggleRecording() async {
     if (_recording) {
       final xFile = await _cam.stopVideoRecording();
       setState(() => _recording = false);
-      await _rememberVideo(File(xFile.path)); // ← just remember; no upload
+      await _rememberVideo(File(xFile.path));
       HapticFeedback.selectionClick();
     } else {
       await _cam.prepareForVideoRecording();
@@ -371,10 +347,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
   // POST { "s3_key": "<path>", … } to Flask /enqueue
   Future<void> _notifyBackend(String s3Path) async {
     const backendEndpoint = 'http://63.178.80.242:5001/enqueue';
-
     try {
-      final sess = await amp.Amplify.Auth.fetchAuthSession()
-          as CognitoAuthSession;
+      final sess = await amp.Amplify.Auth.fetchAuthSession() as CognitoAuthSession;
       final jwt  = sess.userPoolTokensResult.valueOrNull?.accessToken.raw;
 
       final resp = await http.post(
@@ -389,9 +363,11 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen> {
         }),
       );
 
-      resp.statusCode == 202
-          ? debugPrint('✅ backend accepted enqueue')
-          : debugPrint('⚠️ backend ${resp.statusCode}: ${resp.body}');
+      if (resp.statusCode == 202) {
+        debugPrint('✅ backend accepted enqueue');
+      } else {
+        debugPrint('⚠️ backend ${resp.statusCode}: ${resp.body}');
+      }
     } catch (e) {
       debugPrint('⚠️ could not reach backend: $e');
     }
@@ -410,44 +386,7 @@ extension on String {
       isEmpty ? this : '${this[0].toUpperCase()}${substring(1)}';
 }
 
-/* ───────── UI widgets (visual only) ───────── */
-
-class _StatusChip extends StatelessWidget {
-  const _StatusChip({required this.recording, required this.videoReady});
-  final bool recording;
-  final bool videoReady;
-
-  @override
-  Widget build(BuildContext context) {
-    final color = recording
-        ? Colors.red
-        : (videoReady ? const Color(0xFF00C853) : Colors.black54);
-    final label = recording
-        ? 'Recording…'
-        : (videoReady ? 'Video ready' : 'Ready');
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(.92),
-        borderRadius: BorderRadius.circular(24),
-        boxShadow: const [
-          BoxShadow(color: Color(0x1A000000), blurRadius: 12, offset: Offset(0, 4)),
-        ],
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 8, height: 8,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 8),
-          Text(label, style: TextStyle(fontWeight: FontWeight.w600, color: Colors.black87)),
-        ],
-      ),
-    );
-  }
-}
+/* ───────── UI widgets ───────── */
 
 class _ActionPanel extends StatelessWidget {
   const _ActionPanel({
@@ -456,7 +395,7 @@ class _ActionPanel extends StatelessWidget {
     required this.onToggleRecord,
     required this.onPickVideo,
     required this.onAnalyze,
-    required this.onSkip,
+    required this.onAnalyzeCloud,
   });
 
   final bool recording;
@@ -464,12 +403,10 @@ class _ActionPanel extends StatelessWidget {
   final VoidCallback? onToggleRecord;
   final VoidCallback onPickVideo;
   final VoidCallback onAnalyze;
-  final VoidCallback onSkip;
+  final VoidCallback onAnalyzeCloud;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
     return Material(
       elevation: 10,
       color: Colors.white,
@@ -480,24 +417,21 @@ class _ActionPanel extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Record / Stop
             _GradientButton(
               height: 56,
               onPressed: onToggleRecord,
               colors: recording
-                  ? const [Color(0xFFD32F2F), Color(0xFFE53935)]               // intense red while recording
-                  : const [Color(0xFFFFC107), Color(0xFFFF7043)],              // amber → fire red
+                  ? const [Color(0xFFD32F2F), Color(0xFFE53935)]
+                  : const [Color(0xFFFFC107), Color(0xFFFF7043)],
               icon: recording ? Icons.stop : Icons.fiber_manual_record,
               label: recording ? 'Stop recording' : 'Tap to record',
             ),
             const SizedBox(height: 10),
-            // Pick from gallery
             _GhostButton(
               onPressed: onPickVideo,
               icon: Icons.video_library_rounded,
               label: 'Choose existing video',
             ),
-
             if (hasVideo) ...[
               const SizedBox(height: 12),
               const Divider(height: 1),
@@ -508,17 +442,17 @@ class _ActionPanel extends StatelessWidget {
                     child: _GradientButton(
                       height: 52,
                       onPressed: onAnalyze,
-                      colors: const [Color(0xFF00BFA5), Color(0xFF1DE9B6)],   // teal → mint
+                      colors: const [Color(0xFF00BFA5), Color(0xFF1DE9B6)],
                       icon: Icons.analytics,
-                      label: 'Analyze now',
+                      label: 'Analyze offline',
                     ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: _GhostButton(
-                      onPressed: onSkip,
-                      icon: Icons.skip_next,
-                      label: 'Continue without analysis',
+                      onPressed: onAnalyzeCloud,
+                      icon: Icons.cloud_upload,
+                      label: 'Analyze in cloud',
                     ),
                   ),
                 ],
@@ -614,10 +548,7 @@ class _GhostButton extends StatelessWidget {
       ),
       onPressed: onPressed,
       icon: Icon(icon),
-      label: Text(
-        label,
-        style: const TextStyle(fontWeight: FontWeight.w600),
-      ),
+      label: Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
     );
   }
 }
