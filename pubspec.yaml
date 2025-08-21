@@ -26,6 +26,9 @@ dependencies:
   video_player: ^2.8.1
   image_picker: ^1.0.7
   share_plus: ^7.0.2
+  onnxruntime: ^1.4.1
+  ffmpeg_kit_flutter_new: ^3.2.0
+  image: ^4.5.4
 
   # ► Amplify 2.x
   amplify_auth_cognito: ^2.6.1
@@ -65,7 +68,9 @@ flutter:
   generate: true     # enables flutter gen-l10n
 
   assets:
-  - assets/fixtures/
+    - assets/fixtures/
+    - assets/models/
+    - assets/meta/
     # Uncomment as you add real assets
     # - assets/icons/
     # - assets/images/

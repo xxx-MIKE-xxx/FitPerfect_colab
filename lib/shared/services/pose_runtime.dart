@@ -1,0 +1,283 @@
+// lib/shared/services/pose_runtime.dart
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+import 'package:image/image.dart' as img;
+import 'package:onnxruntime/onnxruntime.dart';
+
+import 'ort_session.dart';
+import 'video_sampler.dart';
+import 'tensor_utils.dart';
+
+// lib/shared/services/pose_runtime.dart
+class PosePipelineResult {
+  PosePipelineResult({required this.kpts2d, required this.kpts3d});
+  final List<List<List<double>>> kpts2d; // [T][17][3] (x,y,conf)
+  final List<List<List<double>>> kpts3d; // [T][17][3] (x,y,z)
+
+  Map<String, dynamic> toReport() => {
+    'num_frames': kpts2d.length,
+    'num_joints': 17,
+    'kpts2d': kpts2d,
+    'kpts3d': kpts3d,
+  };
+}
+
+
+class PosePipeline {
+  OrtSession? _yolo;
+  OrtSession? _rtm;
+  OrtSession? _mb;
+
+  Future<void> _ensureModelsLoaded() async {
+    _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
+    _rtm  ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
+    _mb   ??= await OrtManager.fromAsset('assets/models/motionbert_lite_81.onnx');
+  }
+
+  Future<PosePipelineResult> analyzeVideo(File video, {int mbWindow = 81}) async {
+    await _ensureModelsLoaded();
+
+    final frames = await VideoSampler.extract10FpsJpgs(video);
+
+    final all2D = <List<List<double>>>[];
+    for (final f in frames) {
+      final jpg = await f.readAsBytes();
+
+      final yoloIn  = _prepYolo(jpg);                   // (1,3,640,640)
+      final yoloOut = await _run(_yolo!, {'images': yoloIn});
+      final det     = _pickBestPerson(yoloOut.first!);  // may be null
+
+      if (det == null) {
+        all2D.add(List.generate(17, (_) => [0.0, 0.0, 0.0]));
+        continue;
+      }
+
+      final crop = _cropForRtm(jpg, det, outH: 256, outW: 192);
+      final rtmIn   = _prepRtm(crop.image);                 // (1,3,256,192)
+      final rtmOuts = await _run(_rtm!, {'input': rtmIn});  // [simcc_x, simcc_y]
+      final kpts    = _decodeSimCC(rtmOuts, crop.meta);     // back to full-frame px
+      all2D.add(kpts);
+    }
+
+    final T = math.min(mbWindow, all2D.length);
+    final mbIn   = _toMbInput(all2D.take(T).toList());               // [1,T,17,3]
+    final mbOuts = await _run(_mb!, {'input': mbIn});
+    final out3d  = _toList4D(mbOuts.first!.value, dims: [1, T, 17, 3])[0]; // ← .value
+
+    return PosePipelineResult(kpts2d: all2D.take(T).toList(), kpts3d: out3d);
+  }
+
+  Future<List<OrtValue?>> _run(OrtSession s, Map<String, OrtValue> inputs) async {
+    final opts = OrtRunOptions();
+    final outs = await s.runAsync(opts, inputs);
+    opts.release();
+    for (final v in inputs.values) { v.release(); }
+    return outs ?? const [];
+  }
+
+  // ---------- YOLOv8 preprocessing
+
+  OrtValue _prepYolo(Uint8List jpgBytes) {
+    final im = img.decodeImage(jpgBytes)!; // expect 640x640 (letterboxed by sampler)
+    final w = im.width, h = im.height;
+    final chw = Float32List(1 * 3 * h * w);
+    int i = 0;
+    for (int c = 0; c < 3; c++) {
+      for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+          final p = im.getPixel(x, y);
+          final r = getRed(p), g = getGreen(p), b = getBlue(p);
+          final v = (c == 0 ? r : (c == 1 ? g : b)) / 255.0;
+          chw[i++] = v;
+        }
+      }
+    }
+    return OrtValueTensor.createTensorWithDataList(chw, [1, 3, h, w]);
+  }
+
+  _Det? _pickBestPerson(OrtValue out) {
+    // Most exports: [1, 84, 8400]; the plugin gives nested Lists.
+    final data = out.value as List;        // [1][84][N]
+    final flat = _toFloat32(data);         // flatten to Float32List
+    if (flat.isEmpty) return null;
+
+    const stride = 84; // xywh + obj + 80 classes
+    final n = flat.length ~/ stride;
+    double bestScore = 0.0;
+    _Det? best;
+
+    for (int i = 0; i < n; i++) {
+      final off = i * stride;
+      final cx = flat[off + 0], cy = flat[off + 1];
+      final w  = flat[off + 2], h  = flat[off + 3];
+      final score = _sigmoid(flat[off + 4 + 0]); // person prob (class 0)
+      if (score < 0.25) continue;
+
+      final x1 = math.max(0.0, cx - w / 2);
+      final y1 = math.max(0.0, cy - h / 2);
+      final x2 = math.min(640.0, cx + w / 2);
+      final y2 = math.min(640.0, cy + h / 2);
+      if (x2 <= x1 || y2 <= y1) continue;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = _Det(x1, y1, x2, y2, score);
+      }
+    }
+    return best;
+  }
+
+  double _sigmoid(double x) => 1 / (1 + math.exp(-x));
+
+  // ---------- RTMPose cropping + preprocessing
+
+  _CropResult _cropForRtm(Uint8List jpg, _Det det, {required int outH, required int outW}) {
+    final im = img.decodeImage(jpg)!; // 640x640
+    final x1 = det.x1.clamp(0.0, im.width.toDouble());
+    final y1 = det.y1.clamp(0.0, im.height.toDouble());
+    final x2 = det.x2.clamp(0.0, im.width.toDouble());
+    final y2 = det.y2.clamp(0.0, im.height.toDouble());
+
+    final w = (x2 - x1), h = (y2 - y1);
+    const scale = 1.25;
+    final cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+    final halfW = (w * scale) / 2, halfH = (h * scale) / 2;
+    final rx1 = (cx - halfW).clamp(0.0, im.width.toDouble()).toInt();
+    final ry1 = (cy - halfH).clamp(0.0, im.height.toDouble()).toInt();
+    final rx2 = (cx + halfW).clamp(0.0, im.width.toDouble()).toInt();
+    final ry2 = (cy + halfH).clamp(0.0, im.height.toDouble()).toInt();
+
+    final crop = img.copyCrop(im, x: rx1, y: ry1, width: (rx2 - rx1), height: (ry2 - ry1));
+    final resized = img.copyResize(
+      crop, width: outW, height: outH, interpolation: img.Interpolation.average);
+
+    final meta = _CropMeta(
+      srcW: im.width, srcH: im.height,
+      roiX: rx1.toDouble(), roiY: ry1.toDouble(),
+      roiW: (rx2 - rx1).toDouble(), roiH: (ry2 - ry1).toDouble(),
+      outW: outW, outH: outH,
+    );
+    return _CropResult(resized, meta);
+  }
+
+  OrtValue _prepRtm(img.Image patch) {
+    const mean = [0.485, 0.456, 0.406];
+    const std  = [0.229, 0.224, 0.225];
+
+    final h = patch.height, w = patch.width; // 256x192
+    final chw = Float32List(1 * 3 * h * w);
+    int i = 0;
+    for (int c = 0; c < 3; c++) {
+      for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+          final p = patch.getPixel(x, y);
+          final r = getRed(p) / 255.0;
+          final g = getGreen(p) / 255.0;
+          final b = getBlue(p) / 255.0;
+          final v = c == 0
+              ? (r - mean[0]) / std[0]
+              : c == 1
+                  ? (g - mean[1]) / std[1]
+                  : (b - mean[2]) / std[2];
+          chw[i++] = v;
+        }
+      }
+    }
+    return OrtValueTensor.createTensorWithDataList(chw, [1, 3, h, w]);
+  }
+
+  // Decode SIMCC outputs: outs = [(1,17,384), (1,17,512)]
+  List<List<double>> _decodeSimCC(List<OrtValue?> outs, _CropMeta meta) {
+    final simccX = _toList3D(outs[0]!.value); // [1,17,384]
+    final simccY = _toList3D(outs[1]!.value); // [1,17,512]
+    const split = 2.0;
+
+    final List<List<double>> kpts = List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    for (int j = 0; j < 17; j++) {
+      final rowX = simccX[0][j];
+      final rowY = simccY[0][j];
+
+      int ix = 0, iy = 0;
+      double vx = -1e9, vy = -1e9;
+      for (int t = 0; t < rowX.length; t++) { if (rowX[t] > vx) { vx = rowX[t]; ix = t; } }
+      for (int t = 0; t < rowY.length; t++) { if (rowY[t] > vy) { vy = rowY[t]; iy = t; } }
+
+      final px = ix / split; // 0..192
+      final py = iy / split; // 0..256
+
+      final x = meta.roiX + (px / meta.outW) * meta.roiW;
+      final y = meta.roiY + (py / meta.outH) * meta.roiH;
+      final conf = math.min(1.0, math.max(0.0, (vx + vy) / 2.0)); // rough
+
+      kpts[j][0] = x;
+      kpts[j][1] = y;
+      kpts[j][2] = conf;
+    }
+    return kpts;
+  }
+
+  OrtValue _toMbInput(List<List<List<double>>> k2d) {
+    final T = k2d.length;
+    final buf = Float32List(1 * T * 17 * 3);
+    int i = 0;
+    for (int t = 0; t < T; t++) {
+      for (int j = 0; j < 17; j++) {
+        buf[i++] = k2d[t][j][0].toDouble();
+        buf[i++] = k2d[t][j][1].toDouble();
+        buf[i++] = k2d[t][j][2].toDouble();
+      }
+    }
+    return OrtValueTensor.createTensorWithDataList(buf, [1, T, 17, 3]);
+  }
+
+  // -------- list helpers
+
+  Float32List _toFloat32(dynamic v) {
+    if (v is Float32List) return v;
+    if (v is List) {
+      final flat = <double>[];
+      void walk(dynamic a) {
+        if (a is List) { for (final e in a) walk(e); }
+        else if (a is num) flat.add(a.toDouble());
+      }
+      walk(v);
+      return Float32List.fromList(flat);
+    }
+    return Float32List(0);
+  }
+
+  List<List<List<double>>> _toList3D(dynamic v) =>
+      (v as List).map<List<List<double>>>((a) =>
+        (a as List).map<List<double>>((b) =>
+          (b as List).map<double>((c) => (c as num).toDouble()).toList()
+        ).toList()
+      ).toList();
+
+  List<List<List<List<double>>>> _toList4D(dynamic v, {required List<int> dims}) {
+    return (v as List).map<List<List<List<double>>>>((a) =>
+      (a as List).map<List<List<double>>>((b) =>
+        (b as List).map<List<double>>((c) =>
+          (c as List).map<double>((d) => (d as num).toDouble()).toList()
+        ).toList()
+      ).toList()
+    ).toList();
+  }
+}
+
+class _Det { _Det(this.x1, this.y1, this.x2, this.y2, this.score);
+  final double x1, y1, x2, y2, score; }
+
+class _CropMeta {
+  _CropMeta({
+    required this.srcW, required this.srcH,
+    required this.roiX, required this.roiY,
+    required this.roiW, required this.roiH,
+    required this.outW, required this.outH,
+  });
+  final int srcW, srcH, outW, outH;
+  final double roiX, roiY, roiW, roiH;
+}
+class _CropResult { _CropResult(this.image, this.meta);
+  final img.Image image; final _CropMeta meta; }
