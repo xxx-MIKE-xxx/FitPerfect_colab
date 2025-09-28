@@ -129,7 +129,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       _refReady = _matcher.refPoints != null;
       if (kDebugMode) {
         debugPrint('[ExercisePreview] reference loaded: $_refReady '
-            '(kpts=${_matcher.refPoints?.length ?? 0})');
+            '(kpts=${_matcher.refPoints?.length ?? 0}, '
+            'source=${_matcher.refSource ?? 'unknown'})');
       }
     } catch (e) {
       if (kDebugMode) debugPrint('[ExercisePreview] ensureLoaded error: $e');
@@ -282,6 +283,13 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     final mae = _matcher.compareMAEPx(pts);
     _lastMaePx = mae;
     bool ok = _matcher.isMatchByMAE(mae);
+
+    if (kDebugMode) {
+      final refSrc = _matcher.refSource ?? 'unknown';
+      final maeLabel = mae.isFinite ? mae.toStringAsFixed(2) : mae.toString();
+      debugPrint('[PoseMatch] maePx=$maeLabel, match=$ok, '
+          'reference=$refSrc, liveSpace=${w}x$h (raw camera)');
+    }
 
     // 2) Optional sanity checks (each gated by a 0/1 flag from this screen)
     if (ok && (

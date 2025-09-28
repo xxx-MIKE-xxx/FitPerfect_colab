@@ -24,6 +24,7 @@ class LivePoseEngine {
   _Det? _roi;              // last person box in raw coords
   _LetterboxMeta? _lb;     // last letterbox info to map 640→raw
   bool _printedRtmShapes = false; // one-time debug print
+  bool _reportedOutputSpace = false; // one-time keypoint space log
 
   Future<void> _ensureModelsLoaded() async {
     _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
@@ -80,6 +81,12 @@ class LivePoseEngine {
       final yRaw = (k[1] - lb.meta.padY) / lb.meta.scale;
       return Offset(xRaw, yRaw);
     }).toList(growable: false);
+
+    if (kDebugMode && !_reportedOutputSpace) {
+      debugPrint('[LivePoseEngine] Keypoints decoded from RTM crop 256x192, '
+          'YOLO letterbox 640x640 → returning raw-space ${cam.width}x${cam.height} offsets');
+      _reportedOutputSpace = true;
+    }
 
     _frameIdx++;
     return ptsRaw;
