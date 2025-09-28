@@ -56,8 +56,14 @@ class PosePipeline {
 
       final crop = _cropForRtm(jpg, det, outH: 256, outW: 192);
       final rtmIn   = _prepRtm(crop.image);                 // (1,3,256,192)
-      final rtmOuts = await _run(_rtm!, {'input': rtmIn});  // [simcc_x, simcc_y]
-      final kpts    = _decodeSimCC(rtmOuts, crop.meta);     // back to full-frame px
+      final rtmOuts = await _run(_rtm!, {'input': rtmIn});
+      if (kDebugMode && all2D.isEmpty) {
+        debugPrint('RTM outputs shapes (offline): '
+            '${_shapeOf(rtmOuts.isNotEmpty ? rtmOuts[0]?.value : null)}'
+            '${rtmOuts.length > 1 ? ' & ${_shapeOf(rtmOuts[1]?.value)}' : ''}');
+      }
+      final kpts = _decodeAuto(rtmOuts, crop.meta);
+
       all2D.add(kpts);
     }
 
@@ -97,28 +103,61 @@ class PosePipeline {
     return OrtValueTensor.createTensorWithDataList(chw, [1, 3, h, w]);
   }
 
+  // Robust YOLO decode: supports [1,N,84] and [1,84,N], uses obj×class(person) scoring.
   _Det? _pickBestPerson(OrtValue out) {
-    // Most exports: [1, 84, 8400]; the plugin gives nested Lists.
-    final data = out.value as List;        // [1][84][N]
-    final flat = _toFloat32(data);         // flatten to Float32List
-    if (flat.isEmpty) return null;
+    final v = out.value;
+    if (v is! List || v.isEmpty) return null;
+    if (v[0] is! List) return null;
 
-    const stride = 84; // xywh + obj + 80 classes
-    final n = flat.length ~/ stride;
+    // v[0] can be [N,84] or [84,N]
+    final l0 = v[0] as List;
+    if (l0.isEmpty) return null;
+
+    // Determine layout by inspecting first inner list length.
+    bool isNx84;
+    if (l0[0] is List) {
+      final firstInner = l0[0] as List;
+      isNx84 = firstInner.length == 84; // [1, N, 84]
+    } else {
+      return null;
+    }
+
+    // Build rows = [cx, cy, w, h, obj, c0..c79]
+    final rows = <List<double>>[];
+    if (isNx84) {
+      // [1, N, 84]
+      for (final r in (v[0] as List)) {
+        rows.add((r as List).map((e) => (e as num).toDouble()).toList());
+      }
+    } else {
+      // [1, 84, N] -> transpose to [N,84]
+      final C = (v[0] as List).length; // 84
+      final N = ((v[0] as List)[0] as List).length;
+      for (int n = 0; n < N; n++) {
+        final row = <double>[];
+        for (int c = 0; c < C; c++) {
+          row.add((((v[0] as List)[c] as List)[n] as num).toDouble());
+        }
+        rows.add(row);
+      }
+    }
+
     double bestScore = 0.0;
     _Det? best;
+    for (final r in rows) {
+      if (r.length < 84) continue;
+      final cx = r[0], cy = r[1], w = r[2], h = r[3];
 
-    for (int i = 0; i < n; i++) {
-      final off = i * stride;
-      final cx = flat[off + 0], cy = flat[off + 1];
-      final w  = flat[off + 2], h  = flat[off + 3];
-      final score = _sigmoid(flat[off + 4 + 0]); // person prob (class 0)
-      if (score < 0.25) continue;
+      // Proper YOLO scoring: sigmoid(obj) * sigmoid(class_person)
+      final obj = 1.0 / (1.0 + math.exp(-r[4]));
+      final clsPerson = 1.0 / (1.0 + math.exp(-r[5])); // COCO class 0 = person
+      final score = obj * clsPerson;
+      if (score < 0.10) continue; // relaxed threshold
 
-      final x1 = math.max(0.0, cx - w / 2);
-      final y1 = math.max(0.0, cy - h / 2);
-      final x2 = math.min(640.0, cx + w / 2);
-      final y2 = math.min(640.0, cy + h / 2);
+      final x1 = (cx - w / 2).clamp(0.0, 640.0);
+      final y1 = (cy - h / 2).clamp(0.0, 640.0);
+      final x2 = (cx + w / 2).clamp(0.0, 640.0);
+      final y2 = (cy + h / 2).clamp(0.0, 640.0);
       if (x2 <= x1 || y2 <= y1) continue;
 
       if (score > bestScore) {
@@ -214,6 +253,88 @@ class PosePipeline {
       kpts[j][0] = x;
       kpts[j][1] = y;
       kpts[j][2] = conf;
+    }
+    return kpts;
+  }
+
+  // ---------- NEW: auto-detect SimCC vs Heatmap and decode accordingly
+
+  // Inspect nested list tensor shape (for debug/branching)
+  List<int> _shapeOf(dynamic v) {
+    final dims = <int>[];
+    dynamic a = v;
+    while (a is List) {
+      dims.add(a.length);
+      a = a.isNotEmpty ? a[0] : null;
+    }
+    return dims;
+  }
+
+  // Unified decoder: chooses SimCC or Heatmap at runtime based on output shapes.
+  List<List<double>> _decodeAuto(List<OrtValue?> outs, _CropMeta meta) {
+    if (outs.isEmpty || outs[0] == null) {
+      return List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    }
+
+    final v0 = outs[0]!.value;
+    final s0 = _shapeOf(v0);
+
+    // Heatmap ONNX commonly returns [1, K, H, W]
+    if (s0.length == 4) {
+      return _decodeHeatmap(outs[0]!, meta);
+    }
+
+    // SimCC ONNX: two outputs [1, K, 384] & [1, K, 512] (order may vary)
+    if (outs.length >= 2) {
+      final s1 = _shapeOf(outs[1]!.value);
+      final looksSimCC = s0.length == 3 && s1.length == 3 && s0[0] == 1 && s1[0] == 1;
+      if (looksSimCC) {
+        // Pick the smaller "bins" tensor as X (usually 384 < 512)
+        final xFirst = s0.isNotEmpty && s1.isNotEmpty && s0.last <= s1.last;
+        return _decodeSimCC(xFirst ? outs : [outs[1], outs[0]], meta);
+      }
+    }
+
+    // Fallback: try heatmap on first output
+    return _decodeHeatmap(outs[0]!, meta);
+  }
+
+  // Heatmap decoder: argmax per joint over H×W plane, then map from 256×192 crop back to full frame.
+  List<List<double>> _decodeHeatmap(OrtValue heat, _CropMeta meta) {
+    // heat.value is nested lists [1][K][H][W]
+    final n1 = heat.value as List;            // [1]
+    if (n1.isEmpty) return List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    final nk = n1[0] as List;                 // [K]
+    final K = nk.length;
+
+    // infer H, W from first joint
+    final H = (nk[0] as List).length;
+    final W = ((nk[0] as List)[0] as List).length;
+
+    final List<List<double>> kpts = List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    for (int j = 0; j < (K < 17 ? K : 17); j++) {
+      final plane = nk[j] as List;            // [H][W]
+      double best = -1e9;
+      int by = 0, bx = 0;
+      for (int y = 0; y < H; y++) {
+        final row = plane[y] as List;
+        for (int x = 0; x < W; x++) {
+          final v = (row[x] as num).toDouble();
+          if (v > best) { best = v; by = y; bx = x; }
+        }
+      }
+
+      // Back to 256×192 crop coords (center of the heatmap cell)
+      final px = (bx + 0.5) * (meta.outW / W);
+      final py = (by + 0.5) * (meta.outH / H);
+
+      // Then to the 640×640 letterbox ROI in the original frame
+      final x = meta.roiX + (px / meta.outW) * meta.roiW;
+      final y = meta.roiY + (py / meta.outH) * meta.roiH;
+
+      kpts[j][0] = x;
+      kpts[j][1] = y;
+      kpts[j][2] = 1.0; // optional: normalize best and set as confidence
     }
     return kpts;
   }
