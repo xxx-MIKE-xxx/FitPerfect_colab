@@ -17,7 +17,7 @@ class LiveSkeletonOverlay extends StatelessWidget {
     required this.imageSize,         // raw camera size (w,h)
     this.referencePoints,            // aligned reference points in SAME space
     this.mirrorHorizontally = false, // set true for front camera preview
-    this.color = Colors.cyanAccent,
+    this.color = const Color(0xFF2979FF),
     this.thickness = 3.0,
     this.showJoints = true,
     this.jointRadius = 3.5,

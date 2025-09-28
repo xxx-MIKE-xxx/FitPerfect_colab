@@ -20,6 +20,9 @@ class LivePoseEngine {
   OrtSession? _yolo;
   OrtSession? _rtm;
 
+  Float32List? _yoloInputChw; // reusable buffer for YOLO input (1×3×640×640)
+  Float32List? _rtmInputChw;  // reusable buffer for RTMPose input (1×3×256×192)
+
   int _frameIdx = 0;
   _Det? _roi;              // last person box in raw coords
   _LetterboxMeta? _lb;     // last letterbox info to map 640→raw
@@ -124,20 +127,8 @@ class LivePoseEngine {
     final padX = ((640 - nw) ~/ 2);
     final padY = ((640 - nh) ~/ 2);
 
-    // Manual paste: compatible with image ^4.x
-    for (int y = 0; y < resized.height; y++) {
-      for (int x = 0; x < resized.width; x++) {
-        final p = resized.getPixel(x, y);
-        out.setPixelRgba(
-          padX + x,
-          padY + y,
-          getRed(p),
-          getGreen(p),
-          getBlue(p),
-          getAlpha(p),
-        );
-      }
-    }
+    // Fast path: let image package do the blit in one go
+    img.copyInto(out, resized, dstX: padX, dstY: padY);
 
     return _LetterboxResult(
       square: out,
@@ -153,18 +144,24 @@ class LivePoseEngine {
 
   OrtValue _prepYolo(img.Image im) {
     final w = im.width, h = im.height; // 640×640
-    final chw = Float32List(1 * 3 * h * w);
-    int i = 0;
-    for (int c = 0; c < 3; c++) {
-      for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-          final p = im.getPixel(x, y);
-          final r = getRed(p), g = getGreen(p), b = getBlue(p);
-          final v = (c == 0 ? r : (c == 1 ? g : b)) / 255.0;
-          chw[i++] = v;
-        }
-      }
+    final plane = w * h;
+    final needed = 3 * plane;
+    if (_yoloInputChw == null || _yoloInputChw!.length != needed) {
+      _yoloInputChw = Float32List(needed);
     }
+
+    final chw = _yoloInputChw!;
+    final bytes = im.getBytes(order: img.ChannelOrder.rgb);
+
+    for (int i = 0, p = 0; p < plane; p++) {
+      final r = bytes[i++] / 255.0;
+      final g = bytes[i++] / 255.0;
+      final b = bytes[i++] / 255.0;
+      chw[p] = r;
+      chw[plane + p] = g;
+      chw[(plane << 1) + p] = b;
+    }
+
     return OrtValueTensor.createTensorWithDataList(chw, [1, 3, h, w]);
   }
 
@@ -310,24 +307,25 @@ class LivePoseEngine {
     const mean = [0.485, 0.456, 0.406];
     const std  = [0.229, 0.224, 0.225];
     final h = patch.height, w = patch.width; // 256×192
-    final chw = Float32List(1 * 3 * h * w);
-    int i = 0;
-    for (int c = 0; c < 3; c++) {
-      for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-          final p = patch.getPixel(x, y);
-          final r = getRed(p) / 255.0;
-          final g = getGreen(p) / 255.0;
-          final b = getBlue(p) / 255.0;
-          final v = c == 0
-              ? (r - mean[0]) / std[0]
-              : c == 1
-                  ? (g - mean[1]) / std[1]
-                  : (b - mean[2]) / std[2];
-          chw[i++] = v;
-        }
-      }
+    final plane = w * h;
+    final needed = 3 * plane;
+    if (_rtmInputChw == null || _rtmInputChw!.length != needed) {
+      _rtmInputChw = Float32List(needed);
     }
+
+    final chw = _rtmInputChw!;
+    final bytes = patch.getBytes(order: img.ChannelOrder.rgb);
+
+    for (int i = 0, p = 0; p < plane; p++) {
+      final r = bytes[i++] / 255.0;
+      final g = bytes[i++] / 255.0;
+      final b = bytes[i++] / 255.0;
+
+      chw[p] = (r - mean[0]) / std[0];
+      chw[plane + p] = (g - mean[1]) / std[1];
+      chw[(plane << 1) + p] = (b - mean[2]) / std[2];
+    }
+
     return OrtValueTensor.createTensorWithDataList(chw, [1, 3, h, w]);
   }
 
