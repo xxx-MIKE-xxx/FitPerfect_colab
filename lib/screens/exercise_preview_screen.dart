@@ -66,6 +66,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   bool _refReady = false;        // becomes true when reference JSON is loaded
   double? _lastMaePx;            // for debug/toast
   File? _lastVideo;              // last recorded or picked video
+  XFile? _pendingRecording;      // temp holder for safely-stopped recordings
 
   /* ───────────── live 2D pose state ───────────── */
   final LivePoseEngine _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
@@ -673,6 +674,33 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   }
 
   /* ─────────────────── CAMERA ─────────────────── */
+  Future<void> _stopRecordingSafely() async {
+    CameraController? controller;
+    try {
+      controller = _cam;
+    } catch (_) {
+      controller = null;
+    }
+
+    final c = controller;
+    if (c == null) return;
+
+    if (c.value.isStreamingImages) {
+      try {
+        await c.stopImageStream();
+        _streaming = false;
+      } catch (_) {}
+      await Future.delayed(const Duration(milliseconds: 30));
+    }
+
+    if (c.value.isRecordingVideo) {
+      try {
+        final xFile = await c.stopVideoRecording();
+        _pendingRecording = xFile;
+      } catch (_) {}
+    }
+  }
+
   Future<void> _initCamera() async {
     final cams = await availableCameras();
     final selected = cams.firstWhere(
@@ -705,8 +733,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     _glowCtrl.dispose();
     _skeletonColorCtrl.dispose();
     _skeletonFadeCtrl.dispose();
-    // Stop stream safely
-    () async { try { await _setStreaming(false); } catch (_) {} }();
+    _stopRecordingSafely();
     _cam.dispose();
     super.dispose();
   }
@@ -932,15 +959,21 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   Future<void> _toggleRecording() async {
     if (_recording) {
       // Stop recording → resume live stream
-      final xFile = await _cam.stopVideoRecording();
+      _pendingRecording = null;
+      await _stopRecordingSafely();
       setState(() => _recording = false);
-      await _rememberVideo(File(xFile.path));
+      final xFile = _pendingRecording;
+      _pendingRecording = null;
+      if (xFile != null) {
+        await _rememberVideo(File(xFile.path));
+      }
       if (!_streaming) await _setStreaming(true);
       HapticFeedback.selectionClick();
     } else {
       // Start recording → stop live stream (Camera cannot do both)
       if (_streaming) await _setStreaming(false);
       await _cam.prepareForVideoRecording();
+      _pendingRecording = null;
       await _cam.startVideoRecording();
       setState(() => _recording = true);
       HapticFeedback.heavyImpact();
