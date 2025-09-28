@@ -6,6 +6,7 @@ version: 1.0.0+1
 environment:
   sdk: ">=3.4.0 <4.0.0"
 
+
 # ──────────────── regular runtime dependencies ────────────────
 dependencies:
   flutter:
@@ -29,6 +30,7 @@ dependencies:
   onnxruntime: ^1.4.1
   ffmpeg_kit_flutter_new: ^3.2.0
   image: ^4.5.4
+  sensors_plus: ^5.0.1
 
   # ► Amplify 2.x
   amplify_auth_cognito: ^2.6.1
@@ -71,6 +73,10 @@ flutter:
     - assets/fixtures/
     - assets/models/
     - assets/meta/
+    - assets/models/yolov8n.onnx
+    - assets/models/rtmpose-m_256x192.onnx
+    - assets/models/motionbert_lite_81.onnx
+    - assets/meta/coco17_neutral_skeleton.json
     # Uncomment as you add real assets
     # - assets/icons/
     # - assets/images/
