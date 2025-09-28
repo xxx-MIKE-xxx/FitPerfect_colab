@@ -165,10 +165,9 @@ class PoseMatcher {
   /// Decide match using MAE + thresholds.
   bool isMatchByMAE(double maePx) {
     if (!maePx.isFinite) return false;
-    // Dynamic threshold from reference body height + a hard cap.
-    final dyn = (_refBBoxH ?? 0.0) * dynamicMaePctOfRefH;
-    final thr = math.max(fixedMaeThresholdPx, dyn);
-    return maePx <= thr;
+    // Reference pose must be within a fixed pixel error margin to be accepted.
+    const double kReferenceMaeThresholdPx = 230.0;
+    return maePx <= kReferenceMaeThresholdPx;
   }
 
   /// Center the reference skeleton in a given frame size and scale it to a
