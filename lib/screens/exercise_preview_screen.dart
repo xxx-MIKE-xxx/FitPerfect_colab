@@ -14,6 +14,7 @@ import 'package:amplify_flutter/amplify_flutter.dart' as amp;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show Listenable, kDebugMode;
 import 'package:flutter/material.dart';
+import 'package:flutter/painting.dart' show applyBoxFit;
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
@@ -89,8 +90,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   late final AnimationController _skeletonFadeCtrl;
   late final Animation<Color?> _skeletonColorAnim;
   late final Listenable _skeletonAnimation;
-  bool _skeletonRefVisible = true;
   bool _skeletonHiddenAfterMatch = false;
+  bool _logPoseEvents = false;
   StreamSubscription<AccelerometerEvent>? _accelSub;
 
   // Tilt range caps
@@ -227,7 +228,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   void _handleSkeletonVisualStateLocked(bool ok) {
     if (ok) {
       _skeletonHiddenAfterMatch = false;
-      _skeletonRefVisible = false;
       _skeletonFadeCtrl.forward(from: 0.0);
       _skeletonColorCtrl.forward(from: 0.0);
     } else {
@@ -236,7 +236,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       _skeletonColorCtrl.stop();
       _skeletonColorCtrl.value = 0.0;
       _skeletonHiddenAfterMatch = false;
-      _skeletonRefVisible = true;
     }
   }
 
@@ -313,7 +312,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
 
       if (!mounted) return;
       if (ok != _poseOk) {
-        if (kDebugMode) {
+        if (kDebugMode && _logPoseEvents) {
           debugPrint('MAE(px) = ${_lastMaePx?.toStringAsFixed(1)}; ok=$ok');
         }
         setState(() {
@@ -331,7 +330,9 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         });
         _updateCalibrationHold();
       }
-      debugPrint('live 2D pose failed: $e');
+      if (kDebugMode && _logPoseEvents) {
+        debugPrint('live 2D pose failed: $e');
+      }
     } finally {
       _runningEst = false;
     }
@@ -356,7 +357,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     _lastMaePx = mae;
     bool ok = _matcher.isMatchByMAE(mae);
 
-    if (kDebugMode) {
+    if (kDebugMode && _logPoseEvents) {
       final refSrc = _matcher.refSource ?? 'unknown';
       final maeLabel = mae.isFinite ? mae.toStringAsFixed(2) : mae.toString();
       debugPrint('[PoseMatch] maePx=$maeLabel, match=$ok, '
@@ -770,6 +771,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     _skeletonColorCtrl.dispose();
     _skeletonFadeCtrl.dispose();
     _stopRecordingSafely();
+    _logPoseEvents = false;
     _cam.dispose();
     super.dispose();
   }
@@ -786,9 +788,12 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       },
       child: Scaffold(
         backgroundColor: const Color(0xFFF7F9FB),
+        extendBodyBehindAppBar: _recording,
         appBar: AppBar(
           elevation: 0,
-          backgroundColor: const Color(0xFFF7F9FB),
+          backgroundColor:
+              _recording ? Colors.transparent : const Color(0xFFF7F9FB),
+          foregroundColor: _recording ? Colors.white : Colors.black,
           title: Row(
             children: [
               Container(
@@ -837,182 +842,236 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
             ),
           ],
         ),
-        body: Column(
-          children: [
-            // Camera preview + calibration overlays
-            Expanded(
-              child: _ready
-                  ? FittedBox(
-                      fit: BoxFit.cover,
-                      child: SizedBox(
-                        width: _cam.value.previewSize!.height,
-                        height: _cam.value.previewSize!.width,
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            CameraPreview(_cam),
-
-                            // Live skeleton overlay (debug)
-                            if (_showLiveSkeleton &&
-                                _latestPts != null &&
-                                _latestImgSize != null &&
-                                !_skeletonHiddenAfterMatch)
-                              AnimatedBuilder(
-                                animation: _skeletonAnimation,
-                                builder: (context, _) {
-                                  final opacity =
-                                      (1.0 - _skeletonFadeCtrl.value).clamp(0.0, 1.0);
-                                  if (opacity <= 0.0) {
-                                    return const SizedBox.shrink();
-                                  }
-                                  final color = _skeletonColorAnim.value ??
-                                      Colors.redAccent;
-                                  return Opacity(
-                                    opacity: opacity,
-                                    child: LiveSkeletonOverlay(
-                                      points: _latestPts,
-                                      imageSize: _latestImgSize!,
-                                      referencePoints: _skeletonRefVisible
-                                          ? _refOverlayPts
-                                          : null,
-                                      mirrorHorizontally: false,
-                                      color: color,
-                                      thickness: 3.5,
-                                      showJoints: true,
-                                      boxFit: BoxFit.cover,
-                                      alignment: Alignment.center,
-                                    ),
-                                  );
-                                },
-                              ),
-
-                            // Tilt guidance (bigger icon/text; 15–30° target)
-                            Align(
-                              alignment: Alignment.topCenter,
-                              child: Padding(
-                                padding: const EdgeInsets.only(top: 16),
-                                child: AnimatedBuilder(
-                                  animation: _flashCtrl,
-                                  builder: (_, __) {
-                                    final bool outOfRange =
-                                        _tiltTooLow || _tiltTooHigh;
-                                    final double flashingOpacity = outOfRange
-                                        ? (0.55 + 0.45 * _flashCtrl.value)
-                                        : 1.0;
-
-                                    final IconData icon = _tiltTooLow
-                                        ? Icons.north_rounded
-                                        : (_tiltTooHigh
-                                            ? Icons.south_rounded
-                                            : Icons.check_circle_rounded);
-
-                                    final Color iconColor =
-                                        _tiltTooLow || _tiltTooHigh
-                                            ? Colors.orangeAccent
-                                            : Colors.greenAccent;
-
-                                    final String label = _tiltTooLow
-                                        ? 'Increase tilt'
-                                        : (_tiltTooHigh
-                                            ? 'Decrease tilt'
-                                            : 'Perfect');
-
-                                    return Opacity(
-                                      opacity: flashingOpacity,
-                                      child: Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(icon, size: 56, color: iconColor),
-                                          const SizedBox(height: 10),
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(
-                                                horizontal: 14, vertical: 10),
-                                            decoration: BoxDecoration(
-                                              color:
-                                                  Colors.black.withOpacity(.38),
-                                              borderRadius:
-                                                  BorderRadius.circular(14),
-                                            ),
-                                            child: Text(
-                                              label,
-                                              textAlign: TextAlign.center,
-                                              style: const TextStyle(
-                                                color: Colors.white,
-                                                fontWeight: FontWeight.w800,
-                                                fontSize: 20,
-                                                letterSpacing: .2,
-                                              ),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                  },
-                                ),
-                              ),
-                            ),
-
-                            // Calibration outline overlay (glowing red → green → fade)
-                            if (!_hideOutline)
-                              IgnorePointer(
-                                child: AnimatedOpacity(
-                                  duration:
-                                      const Duration(milliseconds: 350),
-                                  opacity: _calibLockedGreen ? 0.0 : 1.0,
-                                  child: CustomPaint(
-                                    painter: _NPoseOutlinePainter(
-                                      pulse: _glowCtrl.value,
-                                      color: _calibLockedGreen
-                                          ? Colors.greenAccent
-                                          : Colors.redAccent,
-                                      isGreen: _calibLockedGreen,
-                                    ),
-                                  ),
-                                ),
-                              ),
-
-                            // If we locked green, draw a final non-pulsing green outline for ~800ms.
-                            if (_calibLockedGreen && !_hideOutline)
-                              CustomPaint(
-                                painter: _NPoseOutlinePainter(
-                                  pulse: 1.0,
-                                  color: Colors.greenAccent,
-                                  isGreen: true,
-                                ),
-                              ),
-
-                            // Bottom gradient to improve legibility of actions over video
-                            const _BottomScrim(),
-                          ],
+        body: _recording
+            ? Stack(
+                fit: StackFit.expand,
+                children: [
+                  _buildCameraContent(context, fullscreen: true),
+                  SafeArea(
+                    child: Align(
+                      alignment: Alignment.bottomCenter,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                        child: _GradientButton(
+                          height: 56,
+                          onPressed: _toggleRecording,
+                          colors: const [Color(0xFFD32F2F), Color(0xFFE53935)],
+                          icon: Icons.stop,
+                          label: 'Stop recording',
                         ),
                       ),
-                    )
-                  : const Center(child: CircularProgressIndicator()),
-            ),
+                    ),
+                  ),
+                ],
+              )
+            : Column(
+                children: [
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(28),
+                        clipBehavior: Clip.antiAlias,
+                        child: _buildCameraContent(context, fullscreen: false),
+                      ),
+                    ),
+                  ),
+                  SafeArea(
+                    top: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                      child: _ActionPanel(
+                        recording: _recording,
+                        hasVideo: _lastVideo != null,
+                        onToggleRecord: _ready ? _toggleRecording : null,
+                        onPickVideo: () async {
+                          final file = await pickVideoFromGallery();
+                          if (file == null) return;
+                          await _rememberVideo(file);
+                        },
+                        onAnalyze: _analyzeOffline,
+                        onAnalyzeCloud: () async {
+                          final f = _lastVideo;
+                          if (f != null) await _uploadAndProcess(f);
+                        },
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
 
-            // Action panel
-            SafeArea(
-              top: false,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
-                child: _ActionPanel(
-                  recording: _recording,
-                  hasVideo: _lastVideo != null,
-                  onToggleRecord: _ready ? _toggleRecording : null,
-                  onPickVideo: () async {
-                    final file = await pickVideoFromGallery();
-                    if (file == null) return;
-                    await _rememberVideo(file);
-                  },
-                  onAnalyze: _analyzeOffline,
-                  onAnalyzeCloud: () async {
-                    final f = _lastVideo;
-                    if (f != null) await _uploadAndProcess(f);
-                  },
+  Widget _buildCameraContent(BuildContext context, {required bool fullscreen}) {
+    if (!_ready || !_cam.value.isInitialized) {
+      return const ColoredBox(
+        color: Colors.black,
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    final previewSize = _cam.value.previewSize;
+    if (previewSize == null) {
+      return const ColoredBox(
+        color: Colors.black,
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    final bool showLiveSkeleton = _showLiveSkeleton &&
+        _latestPts != null &&
+        _latestImgSize != null &&
+        !_skeletonHiddenAfterMatch;
+
+    final bool showOutline = fullscreen &&
+        !_hideOutline &&
+        _refOverlayPts != null &&
+        _latestImgSize != null;
+
+    final double topPadding = fullscreen
+        ? MediaQuery.of(context).padding.top + 16
+        : 16.0;
+
+    Widget buildTiltIndicator() {
+      return AnimatedBuilder(
+        animation: _flashCtrl,
+        builder: (_, __) {
+          final bool outOfRange = _tiltTooLow || _tiltTooHigh;
+          final double flashingOpacity =
+              outOfRange ? (0.55 + 0.45 * _flashCtrl.value) : 1.0;
+
+          final IconData icon = _tiltTooLow
+              ? Icons.north_rounded
+              : (_tiltTooHigh
+                  ? Icons.south_rounded
+                  : Icons.check_circle_rounded);
+
+          final Color iconColor =
+              (_tiltTooLow || _tiltTooHigh) ? Colors.orangeAccent : Colors.greenAccent;
+
+          final String label = _tiltTooLow
+              ? 'Increase tilt'
+              : (_tiltTooHigh ? 'Decrease tilt' : 'Perfect');
+
+          return Opacity(
+            opacity: flashingOpacity,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 68, color: iconColor),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(.42),
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: Text(
+                    label,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w800,
+                      fontSize: 22,
+                      letterSpacing: .2,
+                    ),
+                  ),
                 ),
+              ],
+            ),
+          );
+        },
+      );
+    }
+
+    final Widget stack = Stack(
+      fit: StackFit.expand,
+      children: [
+        CameraPreview(_cam),
+        if (showLiveSkeleton)
+          AnimatedBuilder(
+            animation: _skeletonAnimation,
+            builder: (context, _) {
+              final opacity = (1.0 - _skeletonFadeCtrl.value).clamp(0.0, 1.0);
+              if (opacity <= 0.0) {
+                return const SizedBox.shrink();
+              }
+              final color = _skeletonColorAnim.value ?? Colors.redAccent;
+              return Opacity(
+                opacity: opacity,
+                child: LiveSkeletonOverlay(
+                  points: _latestPts,
+                  imageSize: _latestImgSize!,
+                  referencePoints: null,
+                  mirrorHorizontally: false,
+                  color: color,
+                  thickness: 3.5,
+                  showJoints: false,
+                  boxFit: BoxFit.cover,
+                  alignment: Alignment.center,
+                ),
+              );
+            },
+          ),
+        Align(
+          alignment: Alignment.topCenter,
+          child: Padding(
+            padding: EdgeInsets.only(top: topPadding),
+            child: buildTiltIndicator(),
+          ),
+        ),
+        if (showOutline)
+          IgnorePointer(
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 350),
+              opacity: _calibLockedGreen ? 0.0 : 1.0,
+              child: AnimatedBuilder(
+                animation: _glowCtrl,
+                builder: (_, __) {
+                  final color =
+                      _calibLockedGreen ? Colors.greenAccent : Colors.redAccent;
+                  return CustomPaint(
+                    painter: _ReferenceSkeletonOutlinePainter(
+                      points: _refOverlayPts!,
+                      imageSize: _latestImgSize!,
+                      mirror: false,
+                      pulse: _glowCtrl.value,
+                      color: color,
+                      isGreen: _calibLockedGreen,
+                      boxFit: BoxFit.cover,
+                      alignment: Alignment.center,
+                    ),
+                  );
+                },
               ),
             ),
-          ],
+          ),
+        if (_calibLockedGreen && showOutline)
+          CustomPaint(
+            painter: _ReferenceSkeletonOutlinePainter(
+              points: _refOverlayPts!,
+              imageSize: _latestImgSize!,
+              mirror: false,
+              pulse: 1.0,
+              color: Colors.greenAccent,
+              isGreen: true,
+              boxFit: BoxFit.cover,
+              alignment: Alignment.center,
+            ),
+          ),
+        const _BottomScrim(),
+      ],
+    );
+
+    return ColoredBox(
+      color: Colors.black,
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: previewSize.height,
+          height: previewSize.width,
+          child: stack,
         ),
       ),
     );
@@ -1025,6 +1084,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       await _stopRecordingSafely();
       await Future.delayed(const Duration(milliseconds: 50)); // let native drain
       setState(() => _recording = false);
+      _logPoseEvents = false;
       final xFile = _pendingRecording;
       _pendingRecording = null;
       if (xFile != null) {
@@ -1045,6 +1105,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       _pendingRecording = null;
       await _cam.startVideoRecording();
       setState(() => _recording = true);
+      _logPoseEvents = true;
       HapticFeedback.heavyImpact();
     }
   }
@@ -1118,7 +1179,7 @@ class _ActionPanel extends StatelessWidget {
       borderRadius: BorderRadius.circular(24),
       shadowColor: Colors.black.withOpacity(.1),
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1283,162 +1344,112 @@ class _BottomScrim extends StatelessWidget {
   }
 }
 
-/// Painter for a continuous "N-pose" silhouette overlay (no live skeleton).
-/// Pulses red while calibrating; turns green then fades when locked.
-class _NPoseOutlinePainter extends CustomPainter {
-  _NPoseOutlinePainter({
+/// Painter that reuses the reference skeleton coordinates and renders them as
+/// a glowing outline. This keeps the silhouette perfectly aligned with the
+/// reference pose that powers the matcher.
+class _ReferenceSkeletonOutlinePainter extends CustomPainter {
+  _ReferenceSkeletonOutlinePainter({
+    required this.points,
+    required this.imageSize,
+    required this.mirror,
     required this.pulse,
     required this.color,
     required this.isGreen,
+    required this.boxFit,
+    required this.alignment,
   });
 
+  final List<Offset> points;
+  final Size imageSize;
+  final bool mirror;
   final double pulse; // 0..1
   final Color color;
   final bool isGreen;
+  final BoxFit boxFit;
+  final Alignment alignment;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final w = size.width;
-    final h = size.height;
-    final cx = w / 2;
+    if (points.length < 17 || imageSize.width <= 0 || imageSize.height <= 0) {
+      return;
+    }
 
-    // Layout ratios for a standing person
-    final headR = h * 0.060;
-    final headCY = h * 0.22;
-    final shoulderY = headCY + headR + h * 0.020;
-    final shoulderHW = w * 0.20; // half shoulder width
-    final waistY = shoulderY + h * 0.14;
-    final hipY = waistY + h * 0.10;
-    final footY = h * 0.86;
+    final fitted = applyBoxFit(boxFit, imageSize, size);
+    final dest = Size(fitted.destination.width, fitted.destination.height);
+    if (dest.width <= 0 || dest.height <= 0) return;
+    final scaleX = dest.width / imageSize.width;
+    final scaleY = dest.height / imageSize.height;
 
-    final waistHW = shoulderHW * 0.70;
-    final hipHW = shoulderHW * 0.88;
+    final fx = (alignment.x + 1) / 2.0;
+    final fy = (alignment.y + 1) / 2.0;
+    final offsetX = (size.width - dest.width) * fx;
+    final offsetY = (size.height - dest.height) * fy;
 
-    final armT = w * 0.055;
-    final handY = hipY - h * 0.08;
+    Offset mapPoint(Offset p) {
+      double xLocal = p.dx * scaleX;
+      double yLocal = p.dy * scaleY;
+      if (mirror) {
+        xLocal = dest.width - xLocal;
+      }
+      return Offset(offsetX + xLocal, offsetY + yLocal);
+    }
 
-    final legGap = w * 0.085;
-    final legT = w * 0.095;
+    final mapped = List<Offset?>.filled(points.length, null);
+    for (var i = 0; i < points.length; i++) {
+      final p = points[i];
+      if (_validPoint(p)) {
+        mapped[i] = mapPoint(p);
+      }
+    }
 
-    // ---- Build filled shapes for each body part ----
-    final Path head = Path()
-      ..addOval(Rect.fromCircle(center: Offset(cx, headCY), radius: headR));
-
-    // Torso as a single closed, curved shape (shoulders → waist pinch → hips)
-    final Path torso = Path()
-      ..moveTo(cx + shoulderHW, shoulderY)
-      ..cubicTo(
-        cx + shoulderHW,
-        shoulderY + h * 0.06,
-        cx + waistHW,
-        waistY - h * 0.02,
-        cx + waistHW,
-        waistY,
-      )
-      ..cubicTo(
-        cx + waistHW,
-        waistY + h * 0.02,
-        cx + hipHW,
-        hipY - h * 0.01,
-        cx + hipHW,
-        hipY,
-      )
-      ..lineTo(cx - hipHW, hipY)
-      ..cubicTo(
-        cx - hipHW,
-        hipY - h * 0.01,
-        cx - waistHW,
-        waistY + h * 0.02,
-        cx - waistHW,
-        waistY,
-      )
-      ..cubicTo(
-        cx - waistHW,
-        waistY - h * 0.02,
-        cx - shoulderHW,
-        shoulderY + h * 0.06,
-        cx - shoulderHW,
-        shoulderY,
-      )
-      ..close();
-
-    // Arms (slim rounded rectangles)
-    final Path leftArm = Path()
-      ..addRRect(RRect.fromRectAndRadius(
-        Rect.fromLTRB(
-          cx - shoulderHW - armT,
-          shoulderY,
-          cx - shoulderHW,
-          handY,
-        ),
-        Radius.circular(armT * 0.6),
-      ));
-    final Path rightArm = Path()
-      ..addRRect(RRect.fromRectAndRadius(
-        Rect.fromLTRB(
-          cx + shoulderHW,
-          shoulderY,
-          cx + shoulderHW + armT,
-          handY,
-        ),
-        Radius.circular(armT * 0.6),
-      ));
-
-    // Legs (rounded rectangles) with a center gap
-    final Path leftLeg = Path()
-      ..addRRect(RRect.fromRectAndRadius(
-        Rect.fromLTRB(
-          cx - legGap - legT,
-          hipY,
-          cx - legGap,
-          footY,
-        ),
-        Radius.circular(legT * 0.45),
-      ));
-    final Path rightLeg = Path()
-      ..addRRect(RRect.fromRectAndRadius(
-        Rect.fromLTRB(
-          cx + legGap,
-          hipY,
-          cx + legGap + legT,
-          footY,
-        ),
-        Radius.circular(legT * 0.45),
-      ));
-
-    // Union all shapes to get a single continuous silhouette region
-    Path silhouette = Path.combine(PathOperation.union, head, torso);
-    silhouette = Path.combine(PathOperation.union, silhouette, leftArm);
-    silhouette = Path.combine(PathOperation.union, silhouette, rightArm);
-    silhouette = Path.combine(PathOperation.union, silhouette, leftLeg);
-    silhouette = Path.combine(PathOperation.union, silhouette, rightLeg);
-
-    // ---- Paints: glow + crisp outline ----
-    final double glowAlpha = isGreen ? 0.90 : (0.70 + 0.30 * pulse);
-    final double glowWidth = (isGreen ? 9.0 : 8.0 + 6.0 * pulse);
+    final double baseStroke = dest.shortestSide * 0.035;
+    final double strokeWidth = isGreen ? baseStroke * 0.85 : baseStroke;
+    final double glowWidth = strokeWidth +
+        (isGreen ? baseStroke * 0.45 : baseStroke * (0.75 + 0.45 * pulse));
+    final double glowAlpha = isGreen ? 0.92 : (0.72 + 0.28 * pulse);
 
     final Paint glow = Paint()
       ..color = color.withOpacity(glowAlpha)
       ..style = PaintingStyle.stroke
       ..strokeWidth = glowWidth
+      ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round
-      ..maskFilter = const MaskFilter.blur(BlurStyle.outer, 12);
+      ..maskFilter = const MaskFilter.blur(BlurStyle.outer, 18);
 
     final Paint line = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
-      ..strokeWidth = isGreen ? 4.5 : 3.6
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
 
-    // Draw glow first, then crisp outline
-    canvas.drawPath(silhouette, glow);
-    canvas.drawPath(silhouette, line);
+    for (final edge in _edges) {
+      final Offset? a = mapped[edge[0]];
+      final Offset? b = mapped[edge[1]];
+      if (a == null || b == null) continue;
+      canvas.drawLine(a, b, glow);
+    }
+
+    for (final edge in _edges) {
+      final Offset? a = mapped[edge[0]];
+      final Offset? b = mapped[edge[1]];
+      if (a == null || b == null) continue;
+      canvas.drawLine(a, b, line);
+    }
   }
 
+  bool _validPoint(Offset p) =>
+      p.dx.isFinite && p.dy.isFinite && p.dx != 0 && p.dy != 0;
+
   @override
-  bool shouldRepaint(covariant _NPoseOutlinePainter oldDelegate) {
-    return oldDelegate.pulse != pulse ||
+  bool shouldRepaint(covariant _ReferenceSkeletonOutlinePainter oldDelegate) {
+    return oldDelegate.points != points ||
+        oldDelegate.imageSize != imageSize ||
+        oldDelegate.mirror != mirror ||
+        oldDelegate.pulse != pulse ||
         oldDelegate.color != color ||
-        oldDelegate.isGreen != isGreen;
+        oldDelegate.isGreen != isGreen ||
+        oldDelegate.boxFit != boxFit ||
+        oldDelegate.alignment != alignment;
   }
 }
