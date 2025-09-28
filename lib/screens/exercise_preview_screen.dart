@@ -12,7 +12,7 @@ import 'dart:ui';
 import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
 import 'package:amplify_flutter/amplify_flutter.dart' as amp;
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show Listenable, kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
@@ -84,6 +84,12 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   bool _showLiveSkeleton = true; // toggled via the AppBar eye icon
   List<Offset>? _refOverlayPts;  // reference skeleton shown in overlay (fixed)
   List<Offset>? _refFixedPts;    // same reference used for MAE comparisons
+  late final AnimationController _skeletonColorCtrl;
+  late final AnimationController _skeletonFadeCtrl;
+  late final Animation<Color?> _skeletonColorAnim;
+  late final Listenable _skeletonAnimation;
+  bool _skeletonRefVisible = true;
+  bool _skeletonHiddenAfterMatch = false;
   StreamSubscription<AccelerometerEvent>? _accelSub;
 
   // Tilt range caps
@@ -118,6 +124,34 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       upperBound: 1,
       duration: const Duration(milliseconds: 700),
     )..repeat(reverse: true);
+
+    _skeletonColorCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 350),
+    );
+    _skeletonFadeCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    );
+    _skeletonColorAnim = ColorTween(
+      begin: Colors.redAccent,
+      end: Colors.greenAccent,
+    ).animate(CurvedAnimation(
+      parent: _skeletonColorCtrl,
+      curve: Curves.easeInOut,
+    ));
+    _skeletonAnimation = Listenable.merge([
+      _skeletonColorCtrl,
+      _skeletonFadeCtrl,
+    ]);
+    _skeletonFadeCtrl.addStatusListener((status) {
+      if (!mounted) return;
+      if (status == AnimationStatus.completed && _poseOk) {
+        setState(() {
+          _skeletonHiddenAfterMatch = true;
+        });
+      }
+    });
 
     _initTiltStream();
     _boot(); // async bootstrap (awaits reference + camera, then starts stream)
@@ -189,6 +223,22 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     }
   }
 
+  void _handleSkeletonVisualStateLocked(bool ok) {
+    if (ok) {
+      _skeletonHiddenAfterMatch = false;
+      _skeletonRefVisible = false;
+      _skeletonFadeCtrl.forward(from: 0.0);
+      _skeletonColorCtrl.forward(from: 0.0);
+    } else {
+      _skeletonFadeCtrl.stop();
+      _skeletonFadeCtrl.value = 0.0;
+      _skeletonColorCtrl.stop();
+      _skeletonColorCtrl.value = 0.0;
+      _skeletonHiddenAfterMatch = false;
+      _skeletonRefVisible = true;
+    }
+  }
+
   /* ───────────── live image stream → 2D RTM-Pose ───────────── */
   Future<void> _setStreaming(bool enable) async {
     if (!mounted || !_cam.value.isInitialized) return;
@@ -255,13 +305,19 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         if (kDebugMode) {
           debugPrint('MAE(px) = ${_lastMaePx?.toStringAsFixed(1)}; ok=$ok');
         }
-        setState(() => _poseOk = ok);
+        setState(() {
+          _poseOk = ok;
+          _handleSkeletonVisualStateLocked(ok);
+        });
         _updateCalibrationHold();
       }
     } catch (e) {
       // On any error, be conservative
       if (mounted && _poseOk) {
-        setState(() => _poseOk = false);
+        setState(() {
+          _poseOk = false;
+          _handleSkeletonVisualStateLocked(false);
+        });
         _updateCalibrationHold();
       }
       debugPrint('live 2D pose failed: $e');
@@ -647,6 +703,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     _accelSub?.cancel();
     _flashCtrl.dispose();
     _glowCtrl.dispose();
+    _skeletonColorCtrl.dispose();
+    _skeletonFadeCtrl.dispose();
     // Stop stream safely
     () async { try { await _setStreaming(false); } catch (_) {} }();
     _cam.dispose();
@@ -718,18 +776,37 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
                           CameraPreview(_cam),
 
                           // Live skeleton overlay (debug)
-                          if (_showLiveSkeleton && _latestPts != null && _latestImgSize != null)
-                            LiveSkeletonOverlay(
-                              points: _latestPts,
-                              imageSize: _latestImgSize!,         // raw camera size
-                              referencePoints: _refOverlayPts,    // projected ref → live OR centered fallback
-                              mirrorHorizontally: false, // mirror like front preview
-                              color: Colors.cyanAccent,
-                              thickness: 3.5,
-                              showJoints: true,
-                              // Match outer FittedBox(BoxFit.cover) so mapping is identical
-                              boxFit: BoxFit.cover,
-                              alignment: Alignment.center,
+                          if (_showLiveSkeleton &&
+                              _latestPts != null &&
+                              _latestImgSize != null &&
+                              !_skeletonHiddenAfterMatch)
+                            AnimatedBuilder(
+                              animation: _skeletonAnimation,
+                              builder: (context, _) {
+                                final opacity = (1.0 - _skeletonFadeCtrl.value)
+                                    .clamp(0.0, 1.0);
+                                if (opacity <= 0.0) {
+                                  return const SizedBox.shrink();
+                                }
+                                final color =
+                                    _skeletonColorAnim.value ?? Colors.redAccent;
+                                return Opacity(
+                                  opacity: opacity,
+                                  child: LiveSkeletonOverlay(
+                                    points: _latestPts,
+                                    imageSize: _latestImgSize!,
+                                    referencePoints: _skeletonRefVisible
+                                        ? _refOverlayPts
+                                        : null,
+                                    mirrorHorizontally: false,
+                                    color: color,
+                                    thickness: 3.5,
+                                    showJoints: true,
+                                    boxFit: BoxFit.cover,
+                                    alignment: Alignment.center,
+                                  ),
+                                );
+                              },
                             ),
 
                           // Tilt guidance (bigger icon/text; 15–30° target; simplified messages)
