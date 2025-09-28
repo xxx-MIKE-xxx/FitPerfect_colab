@@ -128,10 +128,10 @@ class LivePoseEngine {
     final padY = ((640 - nh) ~/ 2);
 
     // Fast path: let image package do the blit in one go
-    img.copyInto(out, resized, dstX: padX, dstY: padY);
+    final composited = img.compositeImage(out, resized, dstX: padX, dstY: padY);
 
     return _LetterboxResult(
-      square: out,
+      square: composited,
       meta: _LetterboxMeta(
         srcW: w,
         srcH: h,
