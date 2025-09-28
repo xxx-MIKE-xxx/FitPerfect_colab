@@ -57,35 +57,52 @@ class PoseMatcher {
   /// Cached bbox height for the reference (same units as the JSON, used only as a scale proxy).
   double? _refBBoxH;
 
+  /// Path of the asset that successfully loaded the reference (for debugging).
+  String? _refSource;
+
   bool _loadedTried = false;
 
   /// Expose current COCO-17 reference points (raw, as loaded & remapped).
   List<Offset>? get refPoints => _ref17;
+  String? get refSource => _refSource;
 
   /// Call once during startup (e.g., in initState). Safe to call multiple times.
   Future<void> ensureLoaded() async {
     if (_loadedTried && _ref17 != null) return;
     _loadedTried = true;
+    _refSource = null;
 
     // Try JSON sources first (preferred)
     for (final path in referenceJsonPaths) {
       _ref17 = await _tryLoadFromJson(path);
-      if (_ref17 != null) break;
+      if (_ref17 != null) {
+        _refSource = path;
+        break;
+      }
     }
 
     if (_ref17 == null) {
       // As a last-resort fallback, try legacy .npy names if they exist in your bundle.
       // Comment these out if you want to remove NPY support entirely.
-      _ref17 ??= await _tryLoadFromNpy('assets/meta/reference_frame.npy');
-      _ref17 ??= await _tryLoadFromNpy('assets/meta/reference_frame_26.npy');
+      final npyPaths = [
+        'assets/meta/reference_frame.npy',
+        'assets/meta/reference_frame_26.npy',
+      ];
+      for (final path in npyPaths) {
+        _ref17 = await _tryLoadFromNpy(path);
+        if (_ref17 != null) {
+          _refSource = path;
+          break;
+        }
+      }
     }
 
     if (_ref17 != null) {
       _ref17 = _heuristicToCoco17(_ref17!);
       _refBBoxH = _bboxHeight(_ref17!);
       if (kDebugMode) {
-        debugPrint('[PoseMatcher] Loaded reference with ${_ref17!.length} kpts. '
-            'refBBoxH=${_refBBoxH?.toStringAsFixed(1)}');
+        debugPrint('[PoseMatcher] Loaded reference with ${_ref17!.length} kpts '
+            'from ${_refSource ?? 'unknown'} (refBBoxH=${_refBBoxH?.toStringAsFixed(1)})');
       }
     } else {
       if (kDebugMode) {
@@ -250,22 +267,49 @@ class PoseMatcher {
   /// Extracts a list of Offsets from a variety of JSON shapes.
   List<Offset>? _extractOffsetsFromDynamic(dynamic decoded) {
     List<dynamic>? list;
+
+    // ── Handle common list formats ────────────────────────────────────────────
     if (decoded is List) {
       list = decoded;
+      if (list.isNotEmpty && list.first is num) {
+        return _offsetsFromFlatKeypoints(list.cast<num>());
+      }
     } else if (decoded is Map) {
-      // try common keys
+      // First, detect COCO annotation style { annotations: [ { keypoints: [...] } ] }
+      final ann = decoded['annotations'];
+      if (ann is List) {
+        for (final item in ann) {
+          if (item is Map && item['keypoints'] is List) {
+            final kpList = item['keypoints'] as List<dynamic>;
+            if (kpList.isNotEmpty && kpList.first is num) {
+              final pts = _offsetsFromFlatKeypoints(kpList.cast<num>());
+              if (pts != null && pts.isNotEmpty) return pts;
+            }
+          }
+        }
+      }
+
+      // try common keys that already hold array-of-arrays
       for (final key in ['keypoints', 'points', 'data']) {
         final v = decoded[key];
         if (v is List) {
+          if (v.isNotEmpty && v.first is num) {
+            return _offsetsFromFlatKeypoints(v.cast<num>());
+          }
           list = v;
           break;
         }
       }
+
       // if still null, try first array-like value in the map
       list ??= decoded.values.firstWhere(
         (v) => v is List,
         orElse: () => null,
       ) as List<dynamic>?;
+      final candidate = list;
+      if (candidate != null && candidate.isNotEmpty && candidate.first is num) {
+        return _offsetsFromFlatKeypoints(candidate.cast<num>());
+      }
     }
 
     if (list == null) return null;
@@ -295,6 +339,37 @@ class PoseMatcher {
     for (final e in list) {
       final p = toOffset(e);
       if (p != null && p.dx.isFinite && p.dy.isFinite) out.add(p);
+    }
+    return out;
+  }
+
+  /// Converts flattened keypoints ([x,y,(conf), ...]) into Offsets.
+  List<Offset>? _offsetsFromFlatKeypoints(List<num> flat) {
+    if (flat.length < 2) return null;
+
+    bool isConfChannelLike() {
+      if (flat.length % 3 != 0) return false;
+      int confHits = 0;
+      int samples = 0;
+      for (int j = 2; j < flat.length; j += 3) {
+        final c = flat[j].toDouble().abs();
+        // COCO visibility scores are typically 0, 1, or 2.
+        if (c <= 2.5) confHits++;
+        samples++;
+      }
+      // Require most samples to look like visibility scores to avoid
+      // misclassifying genuine XYZ coordinates as XY + conf.
+      return samples > 0 && confHits / samples >= 0.6;
+    }
+
+    final hasConf = isConfChannelLike();
+    final step = hasConf ? 3 : 2;
+
+    final out = <Offset>[];
+    for (int i = 0; i + 1 < flat.length; i += step) {
+      final x = flat[i].toDouble();
+      final y = flat[i + 1].toDouble();
+      out.add(Offset(x, y));
     }
     return out;
   }
