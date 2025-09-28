@@ -143,6 +143,25 @@ class PoseMatcher {
     return count > 0 ? (sum / count) : double.infinity;
   }
 
+  /// Returns MAE in pixels between live keypoints and a pre-positioned reference
+  /// that is already expressed in the same coordinate space.
+  double compareMAEPxAgainst(List<Offset> live17, List<Offset> reference17) {
+    if (live17.length < 17 || reference17.length < 17) return double.infinity;
+
+    double sum = 0.0;
+    int count = 0;
+    for (int i = 0; i < 17; i++) {
+      final dx = (reference17[i].dx - live17[i].dx).abs();
+      final dy = (reference17[i].dy - live17[i].dy).abs();
+      final d = math.sqrt(dx * dx + dy * dy);
+      if (d.isFinite) {
+        sum += d;
+        count++;
+      }
+    }
+    return count > 0 ? (sum / count) : double.infinity;
+  }
+
   /// Decide match using MAE + thresholds.
   bool isMatchByMAE(double maePx) {
     if (!maePx.isFinite) return false;

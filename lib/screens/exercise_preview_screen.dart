@@ -82,7 +82,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   List<Offset>? _latestPts;
   Size? _latestImgSize;
   bool _showLiveSkeleton = true; // toggled via the AppBar eye icon
-  List<Offset>? _refOverlayPts;  // reference skeleton projected into live frame
+  List<Offset>? _refOverlayPts;  // reference skeleton shown in overlay (fixed)
+  List<Offset>? _refFixedPts;    // same reference used for MAE comparisons
   StreamSubscription<AccelerometerEvent>? _accelSub;
 
   // Tilt range caps
@@ -228,21 +229,20 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
           _latestImgSize = Size(img.width.toDouble(), img.height.toDouble());
 
           if (_matcher.refPoints != null) {
-            // Try aligning reference → live; if that fails, show centered ref as fallback.
-            final aligned = _matcher.referenceAlignedToLive(pts);
-            if (aligned != null) {
-              _refOverlayPts = aligned;
-              _refReady = true;
-            } else {
-              // Fallback centered display so user still *sees* the reference
-              _refOverlayPts =
-                  _matcher.centeredRefForFrame(_latestImgSize!, heightFrac: 0.70);
-            }
+            // Always display (and compare against) a fixed, centered reference pose.
+            _refOverlayPts =
+                _matcher.centeredRefForFrame(_latestImgSize!, heightFrac: 0.70);
+            _refFixedPts = _refOverlayPts;
+            _refReady = _refOverlayPts != null;
           } else {
             _refOverlayPts = null;
+            _refFixedPts = null;
+            _refReady = false;
           }
         } else {
           _refOverlayPts = null; // avoid showing stale reference
+          _refFixedPts = null;
+          _refReady = false;
         }
         setState(() {}); // repaint overlay
       }
@@ -280,7 +280,12 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     }
 
     // 1) Primary: reference-skeleton MAE in pixels
-    final mae = _matcher.compareMAEPx(pts);
+    // Ensure we have a centered reference in the same camera space.
+    _refFixedPts ??=
+        _matcher.centeredRefForFrame(Size(w.toDouble(), h.toDouble()), heightFrac: 0.70);
+    final mae = (_refFixedPts != null)
+        ? _matcher.compareMAEPxAgainst(pts, _refFixedPts!)
+        : double.infinity;
     _lastMaePx = mae;
     bool ok = _matcher.isMatchByMAE(mae);
 
