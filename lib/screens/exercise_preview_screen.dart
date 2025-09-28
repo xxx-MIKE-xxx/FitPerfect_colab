@@ -208,9 +208,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     try {
       final pts = await _engine.estimate2D(img); // Offsets in raw camera space
 
-      // Always keep latest raw image size for overlay mapping (even if no points)
-      _latestImgSize = Size(img.width.toDouble(), img.height.toDouble());
-
       // Log for export (if we have points)
       if (pts != null) {
         final frame = {
@@ -225,24 +222,27 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
 
       // Store for overlay drawing (live + reference projected to live)
       if (mounted) {
-        _latestPts = pts;
+        if (pts != null) {
+          _latestPts = pts;
+          _latestImgSize = Size(img.width.toDouble(), img.height.toDouble());
 
-        if (_matcher.refPoints != null && _latestImgSize != null) {
-          if (pts != null) {
-            // Prefer aligned ref → live; if it fails, fallback to centered
-            _refOverlayPts =
-                _matcher.referenceAlignedToLive(pts) ??
-                _matcher.centeredRefForFrame(_latestImgSize!, heightFrac: 0.70);
+          if (_matcher.refPoints != null) {
+            // Try aligning reference → live; if that fails, show centered ref as fallback.
+            final aligned = _matcher.referenceAlignedToLive(pts);
+            if (aligned != null) {
+              _refOverlayPts = aligned;
+              _refReady = true;
+            } else {
+              // Fallback centered display so user still *sees* the reference
+              _refOverlayPts =
+                  _matcher.centeredRefForFrame(_latestImgSize!, heightFrac: 0.70);
+            }
           } else {
-            // No live pose yet: still show centered reference so it's visible
-            _refOverlayPts =
-                _matcher.centeredRefForFrame(_latestImgSize!, heightFrac: 0.70);
+            _refOverlayPts = null;
           }
-          _refReady = _refOverlayPts != null;
         } else {
-          _refOverlayPts = null;
+          _refOverlayPts = null; // avoid showing stale reference
         }
-
         setState(() {}); // repaint overlay
       }
 
@@ -704,16 +704,13 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
                         children: [
                           CameraPreview(_cam),
 
-                          // Live/reference skeleton overlay:
-                          // Show if we have image size and either live or reference points.
-                          if (_showLiveSkeleton &&
-                              _latestImgSize != null &&
-                              (_latestPts != null || _refOverlayPts != null))
+                          // Live skeleton overlay (debug)
+                          if (_showLiveSkeleton && _latestPts != null && _latestImgSize != null)
                             LiveSkeletonOverlay(
-                              points: _latestPts,                 // may be null
+                              points: _latestPts,
                               imageSize: _latestImgSize!,         // raw camera size
-                              referencePoints: _refOverlayPts,    // aligned or centered
-                              mirrorHorizontally: _mirrorPreview, // mirror like front preview
+                              referencePoints: _refOverlayPts,    // projected ref → live OR centered fallback
+                              mirrorHorizontally: false, // mirror like front preview
                               color: Colors.cyanAccent,
                               thickness: 3.5,
                               showJoints: true,

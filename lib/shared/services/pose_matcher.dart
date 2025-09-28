@@ -40,8 +40,7 @@ class PoseMatcher {
     this.fixedMaeThresholdPx = 30.0, // absolute pixel cap
     this.dynamicMaePctOfRefH = 0.06, // or 6% of the reference bbox height
     this.referenceJsonPaths = const [
-      'assets/meta/reference_frame.json',
-      'assets/meta/reference_frame_26.json',
+      'assets/meta/coco17_neutral_skeleton.json'
     ],
   });
 
