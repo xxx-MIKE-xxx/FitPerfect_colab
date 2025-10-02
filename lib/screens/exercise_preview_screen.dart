@@ -28,7 +28,9 @@ import 'package:url_launcher/url_launcher.dart';
 import '../shared/services/api_client.dart';
 import '../shared/services/live_pose.dart'; // LIVE RTM-Pose 2D
 import '../shared/services/pose_matcher.dart';
+import '../shared/services/pose_processing_controller.dart';
 import '../shared/services/pose_runtime.dart'; // offline pipeline
+import '../shared/services/pose_session_storage.dart';
 import '../shared/services/s3_uploader.dart';
 import '../shared/services/video_transcoder.dart'; // 10fps helper
 import '../shared/widgets/live_skeleton_overlay.dart';
@@ -68,6 +70,13 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   double? _lastMaePx; // for debug/toast
   File? _lastVideo; // last recorded or picked video
   XFile? _pendingRecording; // temp holder for safely-stopped recordings
+  DateTime? _recordingStartedAt;
+
+  late final PoseProcessingController _poseProcessingController;
+  StreamSubscription<ProgressEvent>? _poseProgressSub;
+  ProgressEvent _processingEvent = ProgressEvent.hidden();
+  bool _processingActive = false;
+  String? _activeSessionId;
 
   /* ───────────── live 2D pose state ───────────── */
   final LivePoseEngine _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
@@ -153,6 +162,22 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
           _skeletonHiddenAfterMatch = true;
         });
       }
+    });
+
+    _poseProcessingController = PoseProcessingController();
+    _poseProgressSub =
+        _poseProcessingController.progress.stream.listen((event) {
+      if (!mounted) return;
+      setState(() {
+        _processingEvent = event;
+        if (event.state == ProgressState.complete ||
+            event.state == ProgressState.hidden ||
+            event.state == ProgressState.error) {
+          _processingActive = false;
+        } else {
+          _processingActive = true;
+        }
+      });
     });
 
     _initTiltStream();
@@ -494,7 +519,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     return xFile == null ? null : File(xFile.path);
   }
 
-  Future<void> _rememberVideo(File videoFile) async {
+  Future<File> _rememberVideo(File videoFile) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final ts = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
@@ -506,8 +531,10 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
           SnackBar(content: Text('Video ready • ${saved.path.split('/').last}')),
         );
       }
+      return saved;
     } catch (_) {
       setState(() => _lastVideo = videoFile); // fall back
+      return videoFile;
     }
   }
 
@@ -521,6 +548,100 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     await file
         .writeAsString(const JsonEncoder.withIndent('  ').convert(report));
     return file.path;
+  }
+
+  Future<void> _processRecordedSession(
+    File videoFile,
+    DateTime startedAt,
+    DateTime endedAt,
+  ) async {
+    final sessionId = PoseSessionWriter.newSessionId();
+    setState(() {
+      _processingActive = true;
+      _processingEvent = ProgressEvent.indeterminate(phase: 'Preparing session…');
+    });
+
+    final request = PoseProcessingRequest(
+      videoFile: videoFile,
+      sessionId: sessionId,
+      exerciseId: widget.exerciseId,
+      startTime: startedAt,
+      endTime: endedAt,
+      exerciseLabel: widget.exerciseId.capitalize(),
+      appVersion: null,
+    );
+
+    try {
+      final outcome = await _poseProcessingController.process(request);
+      if (!mounted) return;
+      _activeSessionId = sessionId;
+      await _navigateToFeedback(
+        videoFile.path,
+        'local/${widget.exerciseId}/$sessionId.mp4',
+        const {'data': []},
+        sessionId: sessionId,
+        summary2d: outcome.summary2D,
+        summary3d: outcome.summary3D,
+        meta: outcome.meta,
+      );
+    } on PoseProcessingCancelled {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Processing cancelled.')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('3D processing failed: $e')),
+      );
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _processingActive = false;
+        if (_processingEvent.state != ProgressState.error) {
+          _processingEvent = ProgressEvent.hidden();
+        }
+      });
+    }
+  }
+
+  Future<void> _promptCancelProcessing() async {
+    if (!_processingActive) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Cancel processing?'),
+        content: const Text(
+          'Cancelling will discard all pose data recorded for this session.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Keep processing'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+            child: const Text('Cancel session'),
+          ),
+        ],
+      ),
+    );
+    if (confirm == true) {
+      await _poseProcessingController.cancel();
+      if (!mounted) return;
+      setState(() {
+        _processingActive = false;
+        _processingEvent = ProgressEvent.hidden();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Processing cancelled. Session deleted.')),
+      );
+    }
+  }
+
+  void _handleProcessingCancel() {
+    unawaited(_promptCancelProcessing());
   }
 
   Future<void> _analyzeOffline() async {
@@ -652,7 +773,12 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   Future<void> _navigateToFeedback(
     String videoPath,
     String s3Path,
-    Map<String, dynamic> report,
+    Map<String, dynamic> report, {
+    String? sessionId,
+    Map<String, dynamic>? summary2d,
+    Map<String, dynamic>? summary3d,
+    Map<String, dynamic>? meta,
+  }
   ) async {
     if (!mounted) return;
     await _suspendCameraForRouteChange();
@@ -663,6 +789,10 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         'videoPath': videoPath,
         'videoKey': s3Path,
         'report': report,
+        if (sessionId != null) 'sessionId': sessionId,
+        if (summary2d != null) 'summary2D': summary2d,
+        if (summary3d != null) 'summary3D': summary3d,
+        if (meta != null) 'sessionMeta': meta,
       },
     );
   }
@@ -766,6 +896,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   void dispose() {
     _holdTimer?.cancel();
     _accelSub?.cancel();
+    _poseProgressSub?.cancel();
     _flashCtrl.dispose();
     _glowCtrl.dispose();
     _skeletonColorCtrl.dispose();
@@ -783,13 +914,19 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
 
     return WillPopScope(
       onWillPop: () async {
+        if (_processingActive) {
+          await _promptCancelProcessing();
+          return false;
+        }
         await _suspendCameraForRouteChange();
         return true;
       },
-      child: Scaffold(
-        backgroundColor: const Color(0xFFF7F9FB),
-        extendBodyBehindAppBar: _recording,
-        appBar: AppBar(
+      child: Stack(
+        children: [
+          Scaffold(
+            backgroundColor: const Color(0xFFF7F9FB),
+            extendBodyBehindAppBar: _recording,
+            appBar: AppBar(
           elevation: 0,
           backgroundColor:
               _recording ? Colors.transparent : const Color(0xFFF7F9FB),
@@ -899,6 +1036,19 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
                   ),
                 ],
               ),
+          ),
+          if (_processingEvent.state != ProgressState.hidden)
+            Positioned.fill(
+              child: IgnorePointer(
+                ignoring: !_processingActive,
+                child: _ProcessingBanner(
+                  event: _processingEvent,
+                  onCancel:
+                      _processingActive ? _handleProcessingCancel : null,
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -1085,10 +1235,14 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       await Future.delayed(const Duration(milliseconds: 50)); // let native drain
       setState(() => _recording = false);
       _logPoseEvents = false;
+      final startedAt = _recordingStartedAt ?? DateTime.now();
+      final endedAt = DateTime.now();
+      _recordingStartedAt = null;
       final xFile = _pendingRecording;
       _pendingRecording = null;
       if (xFile != null) {
-        await _rememberVideo(File(xFile.path));
+        final saved = await _rememberVideo(File(xFile.path));
+        await _processRecordedSession(saved, startedAt, endedAt);
       }
       if (!_cam.value.isStreamingImages) {
         await Future.delayed(const Duration(milliseconds: 50));
@@ -1106,6 +1260,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       await _cam.startVideoRecording();
       setState(() => _recording = true);
       _logPoseEvents = true;
+      _recordingStartedAt = DateTime.now();
       HapticFeedback.heavyImpact();
     }
   }
@@ -1225,6 +1380,104 @@ class _ActionPanel extends StatelessWidget {
               ),
             ],
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ProcessingBanner extends StatelessWidget {
+  const _ProcessingBanner({required this.event, this.onCancel});
+
+  final ProgressEvent event;
+  final VoidCallback? onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    if (event.state == ProgressState.hidden) {
+      return const SizedBox.shrink();
+    }
+    final theme = Theme.of(context);
+    final determinate = event.state == ProgressState.determinate;
+    final value = determinate ? (event.value ?? 0.0).clamp(0.0, 1.0) : null;
+    final subtitle = determinate && event.processed != null && event.total != null
+        ? '${event.processed} of ${event.total} windows'
+        : null;
+    final canCancel =
+        onCancel != null && event.state != ProgressState.complete && event.state != ProgressState.error;
+
+    return SafeArea(
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+          child: Material(
+            elevation: 8,
+            borderRadius: BorderRadius.circular(22),
+            color: theme.colorScheme.surface,
+            shadowColor: Colors.black.withOpacity(0.18),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              event.state == ProgressState.complete
+                                  ? 'Processing complete'
+                                  : event.phase,
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            if (subtitle != null)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Text(
+                                  subtitle,
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: theme.textTheme.bodySmall?.color?.withOpacity(0.7),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: canCancel ? onCancel : null,
+                        icon: Icon(
+                          event.state == ProgressState.complete
+                              ? Icons.check_circle_rounded
+                              : Icons.close_rounded,
+                        ),
+                        color: canCancel
+                            ? theme.colorScheme.primary
+                            : theme.colorScheme.outline,
+                        tooltip: canCancel ? 'Cancel processing' : null,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(999),
+                    child: SizedBox(
+                      height: 8,
+                      child: determinate
+                          ? LinearProgressIndicator(value: value)
+                          : const LinearProgressIndicator(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ),
       ),
     );

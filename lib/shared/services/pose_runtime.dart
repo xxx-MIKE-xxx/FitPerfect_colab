@@ -2,77 +2,305 @@
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 import 'package:onnxruntime/onnxruntime.dart';
 
 import 'ort_session.dart';
-import 'video_sampler.dart';
 import 'tensor_utils.dart';
+import 'video_sampler.dart';
 
-// lib/shared/services/pose_runtime.dart
-class PosePipelineResult {
-  PosePipelineResult({required this.kpts2d, required this.kpts3d});
-  final List<List<List<double>>> kpts2d; // [T][17][3] (x,y,conf)
-  final List<List<List<double>>> kpts3d; // [T][17][3] (x,y,z)
+typedef PoseProgressCallback = void Function(PoseProcessingPhase phase, {
+  double? progress,
+  int? processed,
+  int? total,
+});
 
-  Map<String, dynamic> toReport() => {
-    'num_frames': kpts2d.length,
-    'num_joints': 17,
-    'kpts2d': kpts2d,
-    'kpts3d': kpts3d,
-  };
+enum PoseProcessingPhase {
+  sampling2d,
+  persisting2d,
+  preparing3d,
+  estimating3d,
+  persisting3d,
 }
 
+class Keypoint2D {
+  Keypoint2D({
+    required this.id,
+    required this.x,
+    required this.y,
+    this.c,
+  });
+
+  final int id;
+  final double x;
+  final double y;
+  final double? c;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'x': x,
+        'y': y,
+        if (c != null) 'c': c,
+      };
+}
+
+class Pose2DFrame {
+  Pose2DFrame({
+    required this.frameIndex,
+    required this.t,
+    required this.keypoints,
+    required this.imgW,
+    required this.imgH,
+  });
+
+  final int frameIndex;
+  final double t;
+  final List<Keypoint2D> keypoints;
+  final int imgW;
+  final int imgH;
+
+  Map<String, dynamic> toJson() => {
+        'frameIndex': frameIndex,
+        't': double.parse(t.toStringAsFixed(6)),
+        'keypoints': keypoints.map((k) => k.toJson()).toList(),
+        'imgW': imgW,
+        'imgH': imgH,
+      };
+}
+
+class Pose2DSequence {
+  Pose2DSequence({
+    required this.frames,
+    required this.fps,
+    required this.keypointSet,
+    required this.schemaVersion,
+    required this.imgW,
+    required this.imgH,
+  });
+
+  final List<Pose2DFrame> frames;
+  final double fps;
+  final String keypointSet;
+  final int schemaVersion;
+  final int imgW;
+  final int imgH;
+
+  Map<String, dynamic> toIndexJson() => {
+        'frameCount': frames.length,
+        'fps': fps,
+        'keypointSet': keypointSet,
+        'schemaVersion': schemaVersion,
+        'timestamps': {
+          'start': frames.isEmpty ? 0.0 : frames.first.t,
+          'end': frames.isEmpty ? 0.0 : frames.last.t,
+        },
+      };
+}
+
+class Pose3DWindow {
+  Pose3DWindow({
+    required this.windowIndex,
+    required this.frameStart,
+    required this.stride,
+    required this.length,
+    required this.joints3D,
+    required this.units,
+    required this.rootJoint,
+    this.padded = false,
+    this.notes,
+  });
+
+  final int windowIndex;
+  final int frameStart;
+  final int stride;
+  final int length;
+  final List<List<List<double>>> joints3D; // [T][17][3]
+  final String units;
+  final String rootJoint;
+  final bool padded;
+  final String? notes;
+
+  Map<String, dynamic> toJson() => {
+        'windowIndex': windowIndex,
+        'frameStart': frameStart,
+        'stride': stride,
+        'T': length,
+        'joints3D': joints3D,
+        'units': units,
+        'rootJoint': rootJoint,
+        if (padded) 'padded': padded,
+        if (notes != null) 'notes': notes,
+      };
+}
+
+class MotionBertModelInfo {
+  MotionBertModelInfo({
+    required this.assetPath,
+    required this.window,
+    required this.stride,
+  });
+
+  final String assetPath;
+  final int window;
+  final int stride;
+
+  Map<String, dynamic> toJson() => {
+        'onnxPath': assetPath,
+        'T': window,
+        'stride': stride,
+      };
+}
+
+class PosePipelineResult {
+  PosePipelineResult({
+    required this.sequence2d,
+    required this.windows3d,
+    required this.motionBert,
+  });
+
+  final Pose2DSequence sequence2d;
+  final List<Pose3DWindow> windows3d;
+  final MotionBertModelInfo motionBert;
+
+  Map<String, dynamic> toReport() => {
+        'sequence2d': {
+          'frameCount': sequence2d.frames.length,
+          'fps': sequence2d.fps,
+          'keypointSet': sequence2d.keypointSet,
+          'schemaVersion': sequence2d.schemaVersion,
+        },
+        'windows3d': windows3d
+            .map((w) => {
+                  'windowIndex': w.windowIndex,
+                  'frameStart': w.frameStart,
+                  'stride': w.stride,
+                  'T': w.length,
+                  'units': w.units,
+                })
+            .toList(),
+      };
+}
 
 class PosePipeline {
   OrtSession? _yolo;
   OrtSession? _rtm;
   OrtSession? _mb;
 
+  String? _motionBertAsset;
+  int? _motionBertWindow;
+  int? _motionBertStride;
+
+  MotionBertModelInfo? get motionBertInfo => (_motionBertAsset != null &&
+          _motionBertWindow != null &&
+          _motionBertStride != null)
+      ? MotionBertModelInfo(
+          assetPath: _motionBertAsset!,
+          window: _motionBertWindow!,
+          stride: _motionBertStride!,
+        )
+      : null;
+
   Future<void> _ensureModelsLoaded() async {
     _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
-    _rtm  ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
-    _mb   ??= await OrtManager.fromAsset('assets/models/motionbert_lite_81.onnx');
+    _rtm ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
+    if (_mb == null) {
+      try {
+        _motionBertAsset = 'assets/models/motionbert_3d_243.onnx';
+        _motionBertWindow = 243;
+        _motionBertStride = 81;
+        _mb = await OrtManager.fromAsset(_motionBertAsset!);
+      } catch (e) {
+        _motionBertAsset = 'assets/models/motionbert_lite_81.onnx';
+        _motionBertWindow = 81;
+        _motionBertStride = 27;
+        _mb = await OrtManager.fromAsset(_motionBertAsset!);
+      }
+    }
   }
 
-  Future<PosePipelineResult> analyzeVideo(File video, {int mbWindow = 81}) async {
+  Future<PosePipelineResult> analyzeVideo(
+    File video, {
+    PoseProgressCallback? onProgress,
+  }) async {
     await _ensureModelsLoaded();
 
-    final frames = await VideoSampler.extract10FpsJpgs(video);
+    onProgress?.call(PoseProcessingPhase.sampling2d);
+    final sampledFrames = await VideoSampler.extract10FpsJpgs(video);
 
-    final all2D = <List<List<double>>>[];
-    for (final f in frames) {
+    final allFrames = <Pose2DFrame>[];
+    final fps = 10.0;
+
+    for (int i = 0; i < sampledFrames.length; i++) {
+      final f = sampledFrames[i];
       final jpg = await f.readAsBytes();
 
-      final yoloIn  = _prepYolo(jpg);                   // (1,3,640,640)
+      final yoloIn = _prepYolo(jpg); // (1,3,640,640)
       final yoloOut = await _run(_yolo!, {'images': yoloIn});
-      final det     = _pickBestPerson(yoloOut.first!);  // may be null
+      final det = _pickBestPerson(yoloOut.first!);
 
+      final width = 640;
+      final height = 640;
+
+      List<Keypoint2D> mapped;
       if (det == null) {
-        all2D.add(List.generate(17, (_) => [0.0, 0.0, 0.0]));
-        continue;
+        mapped = _emptyH36M();
+      } else {
+        final crop = _cropForRtm(jpg, det, outH: 256, outW: 192);
+        final rtmIn = _prepRtm(crop.image);
+        final rtmOuts = await _run(_rtm!, {'input': rtmIn});
+        if (kDebugMode && allFrames.isEmpty) {
+          debugPrint('RTM outputs shapes (offline): '
+              '${_shapeOf(rtmOuts.isNotEmpty ? rtmOuts[0]?.value : null)}'
+              '${rtmOuts.length > 1 ? ' & ${_shapeOf(rtmOuts[1]?.value)}' : ''}');
+        }
+        final kpts = _decodeAuto(rtmOuts, crop.meta);
+        mapped = _mapRtmToH36M(kpts);
       }
 
-      final crop = _cropForRtm(jpg, det, outH: 256, outW: 192);
-      final rtmIn   = _prepRtm(crop.image);                 // (1,3,256,192)
-      final rtmOuts = await _run(_rtm!, {'input': rtmIn});
-      if (kDebugMode && all2D.isEmpty) {
-        debugPrint('RTM outputs shapes (offline): '
-            '${_shapeOf(rtmOuts.isNotEmpty ? rtmOuts[0]?.value : null)}'
-            '${rtmOuts.length > 1 ? ' & ${_shapeOf(rtmOuts[1]?.value)}' : ''}');
-      }
-      final kpts = _decodeAuto(rtmOuts, crop.meta);
-
-      all2D.add(kpts);
+      allFrames.add(
+        Pose2DFrame(
+          frameIndex: i,
+          t: i / fps,
+          keypoints: mapped,
+          imgW: width,
+          imgH: height,
+        ),
+      );
     }
 
-    final T = math.min(mbWindow, all2D.length);
-    final mbIn   = _toMbInput(all2D.take(T).toList());               // [1,T,17,3]
-    final mbOuts = await _run(_mb!, {'input': mbIn});
-    final out3d  = _toList4D(mbOuts.first!.value, dims: [1, T, 17, 3])[0]; // ← .value
+    final seq = Pose2DSequence(
+      frames: allFrames,
+      fps: fps,
+      keypointSet: 'H36M-17',
+      schemaVersion: 1,
+      imgW: 640,
+      imgH: 640,
+    );
 
-    return PosePipelineResult(kpts2d: all2D.take(T).toList(), kpts3d: out3d);
+    onProgress?.call(PoseProcessingPhase.persisting2d);
+
+    onProgress?.call(PoseProcessingPhase.preparing3d);
+    final mbInfo = motionBertInfo!;
+    final windows =
+        await _estimate3D(seq, window: mbInfo.window, stride: mbInfo.stride,
+            onProgress: (processed, total) {
+      onProgress?.call(
+        PoseProcessingPhase.estimating3d,
+        progress: total == 0 ? 0.0 : processed / total,
+        processed: processed,
+        total: total,
+      );
+    });
+
+    onProgress?.call(PoseProcessingPhase.persisting3d);
+
+    return PosePipelineResult(
+      sequence2d: seq,
+      windows3d: windows,
+      motionBert: mbInfo,
+    );
   }
 
   Future<List<OrtValue?>> _run(OrtSession s, Map<String, OrtValue> inputs) async {
@@ -339,19 +567,226 @@ class PosePipeline {
     return kpts;
   }
 
-  OrtValue _toMbInput(List<List<List<double>>> k2d) {
-    final T = k2d.length;
-    final buf = Float32List(1 * T * 17 * 3);
+  Future<List<Pose3DWindow>> _estimate3D(
+    Pose2DSequence seq, {
+    required int window,
+    required int stride,
+    required void Function(int processed, int total) onProgress,
+  }) async {
+    final frames = seq.frames;
+    if (frames.isEmpty) {
+      return [];
+    }
+
+    final prepared = _prepareWindows(frames, window: window, stride: stride);
+    final total = prepared.length;
+    final results = <Pose3DWindow>[];
+
+    int processed = 0;
+    for (final win in prepared) {
+      final input = _motionBertInput(win.frames, seq.imgW, seq.imgH);
+      final outs = await _run(_mb!, {'input': input});
+      if (outs.isEmpty) {
+        results.add(Pose3DWindow(
+          windowIndex: win.index,
+          frameStart: win.frameStart,
+          stride: stride,
+          length: window,
+          joints3D: List.generate(window, (_) =>
+              List.generate(17, (_) => [0.0, 0.0, 0.0])),
+          units: 'normalized',
+          rootJoint: 'pelvis',
+          padded: win.padded,
+          notes: 'MotionBERT returned no output',
+        ));
+      } else {
+        final out3d = _toList4D(outs.first!.value, dims: [1, window, 17, 3])[0];
+        results.add(Pose3DWindow(
+          windowIndex: win.index,
+          frameStart: win.frameStart,
+          stride: stride,
+          length: window,
+          joints3D: out3d,
+          units: 'normalized',
+          rootJoint: 'pelvis',
+          padded: win.padded,
+          notes: win.padded ? 'padded by temporal reflection' : null,
+        ));
+      }
+      processed++;
+      onProgress(processed, total);
+    }
+
+    return results;
+  }
+
+  OrtValue _motionBertInput(
+    List<Pose2DFrame> frames,
+    int imgW,
+    int imgH,
+  ) {
+    final T = frames.length;
+    final includeConfidence = frames.first.keypoints.any((k) => k.c != null);
+    final C = includeConfidence ? 3 : 2;
+    final buf = Float32List(1 * T * 17 * C);
+    final cx = imgW / 2.0;
+    final cy = imgH / 2.0;
+    final scale = math.max(1e-6, math.min(imgW, imgH) / 2.0);
+
     int i = 0;
-    for (int t = 0; t < T; t++) {
-      for (int j = 0; j < 17; j++) {
-        buf[i++] = k2d[t][j][0].toDouble();
-        buf[i++] = k2d[t][j][1].toDouble();
-        buf[i++] = k2d[t][j][2].toDouble();
+    for (final frame in frames) {
+      for (final k in frame.keypoints) {
+        buf[i++] = ((k.x) - cx) / scale;
+        buf[i++] = ((k.y) - cy) / scale;
+        if (includeConfidence) {
+          buf[i++] = (k.c ?? 1.0).toDouble();
+        }
       }
     }
-    return OrtValueTensor.createTensorWithDataList(buf, [1, T, 17, 3]);
+    return OrtValueTensor.createTensorWithDataList(buf, [1, T, 17, C]);
   }
+
+  List<_PreparedWindow> _prepareWindows(
+    List<Pose2DFrame> frames, {
+    required int window,
+    required int stride,
+  }) {
+    if (frames.isEmpty) return const [];
+    if (frames.length < window) {
+      final padded = _padByReflection(frames, window);
+      return [
+        _PreparedWindow(
+          index: 0,
+          frameStart: 0,
+          frames: padded,
+          padded: true,
+        )
+      ];
+    }
+
+    final result = <_PreparedWindow>[];
+    int index = 0;
+    int start = 0;
+    final lastStart = math.max(0, frames.length - window);
+    while (start <= lastStart) {
+      final slice = frames.sublist(start, start + window);
+      result.add(_PreparedWindow(
+        index: index++,
+        frameStart: start,
+        frames: slice,
+        padded: false,
+      ));
+      start += stride;
+      if (start > lastStart && start - stride != lastStart) {
+        result.add(_PreparedWindow(
+          index: index++,
+          frameStart: lastStart,
+          frames: frames.sublist(lastStart, lastStart + window),
+          padded: false,
+        ));
+        break;
+      }
+    }
+    if (result.isEmpty) {
+      result.add(_PreparedWindow(
+        index: 0,
+        frameStart: lastStart,
+        frames: frames.sublist(lastStart, lastStart + window),
+        padded: false,
+      ));
+    }
+    return result;
+  }
+
+  List<Pose2DFrame> _padByReflection(List<Pose2DFrame> frames, int target) {
+    if (frames.isEmpty) return [];
+    final list = List<Pose2DFrame>.from(frames);
+    int frameIdx = frames.length;
+    while (list.length < target) {
+      for (int i = math.max(0, frames.length - 2); i >= 0 && list.length < target; i--) {
+        final src = frames[i];
+        list.add(Pose2DFrame(
+          frameIndex: frameIdx++,
+          t: src.t,
+          keypoints: src.keypoints,
+          imgW: src.imgW,
+          imgH: src.imgH,
+        ));
+      }
+      if (frames.length == 1) {
+        while (list.length < target) {
+          list.add(Pose2DFrame(
+            frameIndex: frameIdx++,
+            t: frames.first.t,
+            keypoints: frames.first.keypoints,
+            imgW: frames.first.imgW,
+            imgH: frames.first.imgH,
+          ));
+        }
+      }
+    }
+    return list.sublist(0, target);
+  }
+
+  List<Keypoint2D> _mapRtmToH36M(List<List<double>> raw) {
+    final hipsLeft = raw[11];
+    final hipsRight = raw[12];
+    final kneeLeft = raw[13];
+    final kneeRight = raw[14];
+    final ankleLeft = raw[15];
+    final ankleRight = raw[16];
+    final shoulderLeft = raw[5];
+    final shoulderRight = raw[6];
+    final elbowLeft = raw[7];
+    final elbowRight = raw[8];
+    final wristLeft = raw[9];
+    final wristRight = raw[10];
+    final nose = raw[0];
+
+    double conf(List<double> v) => v.length > 2 ? v[2] : 1.0;
+    List<double> avg(List<double> a, List<double> b) => [
+          (a[0] + b[0]) / 2,
+          (a[1] + b[1]) / 2,
+          (conf(a) + conf(b)) / 2,
+        ];
+
+    final pelvis = avg(hipsLeft, hipsRight);
+    final spine = avg(pelvis, avg(shoulderLeft, shoulderRight));
+    final thorax = avg(shoulderLeft, shoulderRight);
+    final neck = avg(thorax, nose);
+
+    List<Keypoint2D> make(List<double> src, int id) => Keypoint2D(
+          id: id,
+          x: src[0],
+          y: src[1],
+          c: src.length > 2 ? src[2] : null,
+        );
+
+    return [
+      make(pelvis, 0),
+      make(hipsRight, 1),
+      make(kneeRight, 2),
+      make(ankleRight, 3),
+      make(hipsLeft, 4),
+      make(kneeLeft, 5),
+      make(ankleLeft, 6),
+      make(spine, 7),
+      make(thorax, 8),
+      make(neck, 9),
+      make(nose, 10),
+      make(shoulderLeft, 11),
+      make(elbowLeft, 12),
+      make(wristLeft, 13),
+      make(shoulderRight, 14),
+      make(elbowRight, 15),
+      make(wristRight, 16),
+    ];
+  }
+
+  List<Keypoint2D> _emptyH36M() => List<Keypoint2D>.generate(
+        17,
+        (i) => Keypoint2D(id: i, x: 0, y: 0, c: 0),
+      );
 
   // -------- list helpers
 
@@ -402,3 +837,17 @@ class _CropMeta {
 }
 class _CropResult { _CropResult(this.image, this.meta);
   final img.Image image; final _CropMeta meta; }
+
+class _PreparedWindow {
+  _PreparedWindow({
+    required this.index,
+    required this.frameStart,
+    required this.frames,
+    required this.padded,
+  });
+
+  final int index;
+  final int frameStart;
+  final List<Pose2DFrame> frames;
+  final bool padded;
+}
