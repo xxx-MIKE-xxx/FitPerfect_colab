@@ -29,9 +29,11 @@ import '../shared/services/api_client.dart';
 import '../shared/services/live_pose.dart'; // LIVE RTM-Pose 2D
 import '../shared/services/pose_matcher.dart';
 import '../shared/services/pose_runtime.dart'; // offline pipeline
+import '../shared/services/pose_processing_controller.dart';
 import '../shared/services/s3_uploader.dart';
 import '../shared/services/video_transcoder.dart'; // 10fps helper
 import '../shared/widgets/live_skeleton_overlay.dart';
+import '../shared/widgets/processing_banner.dart';
 
 class ExercisePreviewScreen extends StatefulWidget {
   const ExercisePreviewScreen({super.key, required this.exerciseId});
@@ -68,6 +70,10 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   double? _lastMaePx; // for debug/toast
   File? _lastVideo; // last recorded or picked video
   XFile? _pendingRecording; // temp holder for safely-stopped recordings
+  late final PoseProcessingController _processingController;
+  StreamSubscription<ProgressEvent>? _processingSub;
+  ProgressEvent? _progressEvent;
+  DateTime? _recordingStartedAt;
 
   /* ───────────── live 2D pose state ───────────── */
   final LivePoseEngine _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
@@ -114,6 +120,23 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   @override
   void initState() {
     super.initState();
+    _processingController = PoseProcessingController();
+    _processingSub = _processingController.progressStream.listen((event) {
+      if (!mounted) return;
+      setState(() {
+        _progressEvent = event;
+      });
+      if (event.status == ProgressStatus.complete ||
+          event.status == ProgressStatus.error ||
+          event.status == ProgressStatus.cancelled) {
+        Future.delayed(const Duration(seconds: 1), () {
+          if (!mounted) return;
+          if (_progressEvent == event) {
+            setState(() => _progressEvent = null);
+          }
+        });
+      }
+    });
     _glowCtrl = AnimationController(
       vsync: this,
       lowerBound: 0.35,
@@ -494,7 +517,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     return xFile == null ? null : File(xFile.path);
   }
 
-  Future<void> _rememberVideo(File videoFile) async {
+  Future<File> _rememberVideo(File videoFile) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       final ts = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
@@ -506,8 +529,10 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
           SnackBar(content: Text('Video ready • ${saved.path.split('/').last}')),
         );
       }
+      return saved;
     } catch (_) {
       setState(() => _lastVideo = videoFile); // fall back
+      return videoFile;
     }
   }
 
@@ -773,6 +798,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     _stopRecordingSafely();
     _logPoseEvents = false;
     _cam.dispose();
+    _processingSub?.cancel();
+    unawaited(_processingController.dispose());
     super.dispose();
   }
 
@@ -842,63 +869,65 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
             ),
           ],
         ),
-        body: _recording
-            ? Stack(
-                fit: StackFit.expand,
-                children: [
-                  _buildCameraContent(context, fullscreen: true),
-                  SafeArea(
-                    child: Align(
-                      alignment: Alignment.bottomCenter,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                        child: _GradientButton(
-                          height: 56,
-                          onPressed: _toggleRecording,
-                          colors: const [Color(0xFFD32F2F), Color(0xFFE53935)],
-                          icon: Icons.stop,
-                          label: 'Stop recording',
+        body: _withProcessingOverlay(
+          _recording
+              ? Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    _buildCameraContent(context, fullscreen: true),
+                    SafeArea(
+                      child: Align(
+                        alignment: Alignment.bottomCenter,
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                          child: _GradientButton(
+                            height: 56,
+                            onPressed: _toggleRecording,
+                            colors: const [Color(0xFFD32F2F), Color(0xFFE53935)],
+                            icon: Icons.stop,
+                            label: 'Stop recording',
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                ],
-              )
-            : Column(
-                children: [
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(28),
-                        clipBehavior: Clip.antiAlias,
-                        child: _buildCameraContent(context, fullscreen: false),
+                  ],
+                )
+              : Column(
+                  children: [
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(28),
+                          clipBehavior: Clip.antiAlias,
+                          child: _buildCameraContent(context, fullscreen: false),
+                        ),
                       ),
                     ),
-                  ),
-                  SafeArea(
-                    top: false,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                      child: _ActionPanel(
-                        recording: _recording,
-                        hasVideo: _lastVideo != null,
-                        onToggleRecord: _ready ? _toggleRecording : null,
-                        onPickVideo: () async {
-                          final file = await pickVideoFromGallery();
-                          if (file == null) return;
-                          await _rememberVideo(file);
-                        },
-                        onAnalyze: _analyzeOffline,
-                        onAnalyzeCloud: () async {
-                          final f = _lastVideo;
-                          if (f != null) await _uploadAndProcess(f);
-                        },
+                    SafeArea(
+                      top: false,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                        child: _ActionPanel(
+                          recording: _recording,
+                          hasVideo: _lastVideo != null,
+                          onToggleRecord: _ready ? _toggleRecording : null,
+                          onPickVideo: () async {
+                            final file = await pickVideoFromGallery();
+                            if (file == null) return;
+                            await _rememberVideo(file);
+                          },
+                          onAnalyze: _analyzeOffline,
+                          onAnalyzeCloud: () async {
+                            final f = _lastVideo;
+                            if (f != null) await _uploadAndProcess(f);
+                          },
+                        ),
                       ),
                     ),
-                  ),
-                ],
-              ),
+                  ],
+                ),
+        ),
       ),
     );
   }
@@ -1081,6 +1110,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     if (_recording) {
       // Stop recording → resume live stream
       _pendingRecording = null;
+      final endTime = DateTime.now();
       await _stopRecordingSafely();
       await Future.delayed(const Duration(milliseconds: 50)); // let native drain
       setState(() => _recording = false);
@@ -1088,13 +1118,15 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       final xFile = _pendingRecording;
       _pendingRecording = null;
       if (xFile != null) {
-        await _rememberVideo(File(xFile.path));
+        final saved = await _rememberVideo(File(xFile.path));
+        await _runPostRecordingPipeline(saved, endTime: endTime);
       }
       if (!_cam.value.isStreamingImages) {
         await Future.delayed(const Duration(milliseconds: 50));
         await _setStreaming(true);
       }
       HapticFeedback.selectionClick();
+      _recordingStartedAt = null;
     } else {
       // Start recording → stop live stream (Camera cannot do both)
       if (_cam.value.isStreamingImages) {
@@ -1106,8 +1138,121 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       await _cam.startVideoRecording();
       setState(() => _recording = true);
       _logPoseEvents = true;
+      _recordingStartedAt = DateTime.now();
       HapticFeedback.heavyImpact();
     }
+  }
+
+  Future<void> _runPostRecordingPipeline(
+    File videoFile, {
+    required DateTime endTime,
+  }) async {
+    if (_processingController.isProcessing) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Processing already in progress…')),
+        );
+      }
+      return;
+    }
+
+    final startTime = _recordingStartedAt ?? endTime;
+    final preview = _cam.value.previewSize;
+    final width = preview == null ? 0 : preview.height.toInt();
+    final height = preview == null ? 0 : preview.width.toInt();
+
+    final meta = VideoMeta(
+      sessionId: generateSessionId(),
+      fps: 10.0,
+      width: width,
+      height: height,
+      exercise: widget.exerciseId,
+      startTime: startTime,
+      endTime: endTime,
+      platform: Platform.isIOS ? 'ios' : 'android',
+      appVersion: 'dev-build',
+    );
+
+    try {
+      final outcome = await _processingController.processRecording(
+        videoFile: videoFile,
+        meta: meta,
+      );
+      final report = outcome.toFeedbackReport();
+      if (!mounted) return;
+      await _navigateToFeedback(
+        videoFile.path,
+        'local/${widget.exerciseId}/${outcome.sessionId}.mp4',
+        report,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('🎯 3D pose analysis ready!')),
+      );
+    } on PoseProcessingCancelled {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('3D processing cancelled.')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('3D analysis failed: $e')),
+      );
+    }
+  }
+
+  Future<void> _confirmCancelProcessing() async {
+    if (!_processingController.isProcessing) return;
+    final confirm = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Cancel processing?'),
+            content: const Text(
+                'This will discard all pose data captured for this session.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Keep processing'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text('Cancel'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+    if (confirm) {
+      _processingController.cancel();
+    }
+  }
+
+  Widget _withProcessingOverlay(Widget child) {
+    final event = _progressEvent;
+    if (event == null || event.isHidden) {
+      return child;
+    }
+    final allowCancel = event.status == ProgressStatus.indeterminate ||
+        event.status == ProgressStatus.determinate;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        child,
+        SafeArea(
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: ProcessingBanner(
+                event: event,
+                onCancel: allowCancel ? _confirmCancelProcessing : null,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 
   // POST { "s3_key": "<path>", … } to Flask /enqueue
