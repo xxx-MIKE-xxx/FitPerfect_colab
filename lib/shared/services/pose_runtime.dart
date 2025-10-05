@@ -183,6 +183,14 @@ class MotionBertConfig {
 class PosePipelineCancelled implements Exception {}
 
 class PosePipeline {
+  // --- Letterbox state for last YOLO input ---
+  double _lbR = 1.0; // scale used (min(tw/w, th/h))
+  double _lbDw = 0.0; // pad x
+  double _lbDh = 0.0; // pad y
+  int _lbW = 640;
+  int _lbH = 640;
+  int _origW = 0;
+  int _origH = 0;
   OrtSession? _yolo;
   OrtSession? _rtm;
   OrtSession? _mb;
@@ -451,151 +459,147 @@ class PosePipeline {
     return outs ?? const [];
   }
 
-  OrtValue _prepYolo(img.Image im) {
-    final w = im.width;
-    final h = im.height;
-    final plane = w * h;
-    final buf = Float32List(3 * plane);
-    final bytes = im.getBytes(order: img.ChannelOrder.rgb);
+  
+OrtValue _prepYolo(img.Image im) {
+  // Store original dims
+  _origW = im.width;
+  _origH = im.height;
 
-    for (int i = 0, p = 0; p < plane; p++) {
-      final r = bytes[i++] / 255.0;
-      final g = bytes[i++] / 255.0;
-      final b = bytes[i++] / 255.0;
-      buf[p] = r;
-      buf[plane + p] = g;
-      buf[(plane << 1) + p] = b;
-    }
-    return OrtValueTensor.createTensorWithDataList(buf, [1, 3, h, w]);
+  // Letterbox to 640x640 with pad 114, keep scale/offsets
+  const tw = 640, th = 640;
+  final r = math.min(th / _origH, tw / _origW);
+  final newW = (_origW * r).round();
+  final newH = (_origH * r).round();
+  final resized = img.copyResize(im, width: newW, height: newH, interpolation: img.Interpolation.nearest);
+  final canvas = img.Image(width: tw, height: th);
+  // fill with 114 gray
+  img.fill(canvas, color: img.ColorRgb8(114, 114, 114));
+  final left = ((tw - newW) / 2).floor();
+  final top  = ((th - newH) / 2).floor();
+  img.compositeImage(canvas, resized, dstX: left, dstY: top, dstW: newW, dstH: newH, blend: img.BlendMode.direct);
+
+  // Save letterbox meta for unmapping
+  _lbR = r;
+  _lbDw = left.toDouble();
+  _lbDh = top.toDouble();
+  _lbW = tw;
+  _lbH = th;
+
+  // Export CHW float32 in RGB/255
+  final w = canvas.width;
+  final h = canvas.height;
+  final plane = w * h;
+  final buf = Float32List(3 * plane);
+  final bytes = canvas.getBytes(order: img.ChannelOrder.rgb);
+  for (int i = 0, p = 0; p < plane; p++) {
+    final r8 = bytes[i++] / 255.0;
+    final g8 = bytes[i++] / 255.0;
+    final b8 = bytes[i++] / 255.0;
+    buf[p] = r8;
+    buf[plane + p] = g8;
+    buf[(plane << 1) + p] = b8;
   }
+  return OrtValueTensor.createTensorWithDataList(buf, [1, 3, h, w]);
+}
 
-  _Det? _pickBestPerson(OrtValue out) {
-    final v = out.value;
-    if (v is! List || v.isEmpty) return null;
-    final first = v[0];
-    if (first is! List || first.isEmpty) return null;
+_Det? _pickBestPerson(OrtValue out) {
+  // Expect Ultralytics YOLOv8: [1, 84, N] (4 box + 80 classes).
+  // Some exports may be [1, N, 84]; handle both.
+  final v = out.value;
+  if (v is! List || v.isEmpty) return null;
+  final l0 = v[0];
+  if (l0 is! List || l0.isEmpty) return null;
 
-    List<List<double>> rows;
-    if (first[0] is List) {
-      // [1, N, 84]
-      rows = (first as List)
-          .map<List<double>>(
-            (row) => (row as List).map((e) => (e as num).toDouble()).toList(),
-          )
-          .toList();
-    } else {
-      // [1, 84, N] -> transpose
-      final channels = (v[0] as List).length;
-      final proposals = ((v[0] as List)[0] as List).length;
-      rows = List.generate(proposals, (n) {
-        final row = <double>[];
-        for (int c = 0; c < channels; c++) {
-          row.add((((v[0] as List)[c] as List)[n] as num).toDouble());
+  // Convert to [N,84] double array
+  List<List<double>> arr;
+  // Try [84, N]
+  bool parsed = false;
+  try {
+    final chans = (v[0] as List);
+    final C = chans.length;
+    final N = (chans[0] as List).length;
+    if (C == 84) {
+      arr = List.generate(N, (i) {
+        final row = List<double>.filled(C, 0.0);
+        for (int c = 0; c < C; c++) {
+          row[c] = ((chans[c] as List)[i] as num).toDouble();
         }
         return row;
       });
+      parsed = true;
+    } else {
+      arr = const [];
     }
+  } catch (_) {
+    arr = const [];
+  }
+  if (!parsed) {
+    // Fallback: assume [N,84]
+    final rows = (v[0] as List);
+    arr = rows
+        .map<List<double>>((row) =>
+            (row as List).map((e) => (e as num).toDouble()).toList())
+        .toList();
+  }
 
-    double bestScore = 0.0;
-    _Det? best;
-    for (final r in rows) {
-      if (r.length < 84) continue;
-      final cx = r[0];
-      final cy = r[1];
-      final w = r[2];
-      final h = r[3];
-      final obj = _sigmoid(r[4]);
-      final cls = _sigmoid(r[5]);
-      final score = obj * cls;
-      if (score < 0.10) continue;
-      final x1 = (cx - w / 2).clamp(0.0, 640.0);
-      final y1 = (cy - h / 2).clamp(0.0, 640.0);
-      final x2 = (cx + w / 2).clamp(0.0, 640.0);
-      final y2 = (cy + h / 2).clamp(0.0, 640.0);
-      if (x2 <= x1 || y2 <= y1) continue;
-      if (score > bestScore) {
-        bestScore = score;
-        best = _Det(x1, y1, x2, y2, score);
+  // Select best person by class 0 score
+  const int personClass = 0;
+  double bestScore = -1.0;
+  _Det? best;
+  for (final r in arr) {
+    if (r.length < 84) continue;
+    final cx = r[0];
+    final cy = r[1];
+    final w = r[2];
+    final h = r[3];
+    final clsLogit = r[4 + personClass];
+    final score = 1.0 / (1.0 + math.exp(-clsLogit)); // sigmoid
+    if (score < 0.25) continue;
+
+    // xywh (letterbox space)
+    double x1 = cx - w / 2.0;
+    double y1 = cy - h / 2.0;
+    double x2 = cx + w / 2.0;
+    double y2 = cy + h / 2.0;
+
+    // Map from letterbox -> original image
+    double ox1 = (x1 - _lbDw) / _lbR;
+    double oy1 = (y1 - _lbDh) / _lbR;
+    double ox2 = (x2 - _lbDw) / _lbR;
+    double oy2 = (y2 - _lbDh) / _lbR;
+
+    // Clip
+    ox1 = ox1.clamp(0.0, _origW.toDouble());
+    oy1 = oy1.clamp(0.0, _origH.toDouble());
+    ox2 = ox2.clamp(0.0, _origW.toDouble());
+    oy2 = oy2.clamp(0.0, _origH.toDouble());
+    if (ox2 <= ox1 || oy2 <= oy1) continue;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = _Det(ox1, oy1, ox2, oy2, score);
+    }
+  }
+
+OrtValue _prepRtm(img.Image patch) {
+  final h = patch.height;
+  final w = patch.width;
+  final buf = Float32List(3 * h * w);
+  int i = 0;
+  for (int c = 0; c < 3; c++) {
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final p = patch.getPixel(x, y);
+        final r = img.getRed(p) / 255.0;
+        final g = img.getGreen(p) / 255.0;
+        final b = img.getBlue(p) / 255.0;
+        final v = c == 0 ? r : (c == 1 ? g : b);
+        buf[i++] = v;
       }
     }
-    return best;
   }
-
-  double _sigmoid(double x) => 1 / (1 + math.exp(-x));
-
-  _CropResult _cropForRtm(Uint8List jpg, _Det det, {required int outH, required int outW}) {
-    final im = img.decodeImage(jpg)!;
-    final x1 = det.x1.clamp(0.0, im.width.toDouble());
-    final y1 = det.y1.clamp(0.0, im.height.toDouble());
-    final x2 = det.x2.clamp(0.0, im.width.toDouble());
-    final y2 = det.y2.clamp(0.0, im.height.toDouble());
-
-    final w = (x2 - x1);
-    final h = (y2 - y1);
-    const scale = 1.25;
-    final cx = (x1 + x2) / 2;
-    final cy = (y1 + y2) / 2;
-    final halfW = (w * scale) / 2;
-    final halfH = (h * scale) / 2;
-    final rx1 = (cx - halfW).clamp(0.0, im.width.toDouble()).toInt();
-    final ry1 = (cy - halfH).clamp(0.0, im.height.toDouble()).toInt();
-    final rx2 = (cx + halfW).clamp(0.0, im.width.toDouble()).toInt();
-    final ry2 = (cy + halfH).clamp(0.0, im.height.toDouble()).toInt();
-
-    final crop = img.copyCrop(
-      im,
-      x: rx1,
-      y: ry1,
-      width: (rx2 - rx1),
-      height: (ry2 - ry1),
-    );
-
-    final resized = img.copyResize(
-      crop,
-      width: outW,
-      height: outH,
-      interpolation: img.Interpolation.average,
-    );
-
-    final meta = _CropMeta(
-      srcW: im.width,
-      srcH: im.height,
-      roiX: rx1.toDouble(),
-      roiY: ry1.toDouble(),
-      roiW: (rx2 - rx1).toDouble(),
-      roiH: (ry2 - ry1).toDouble(),
-      outW: outW,
-      outH: outH,
-    );
-    return _CropResult(resized, meta);
-  }
-
-  OrtValue _prepRtm(img.Image patch) {
-    const mean = [0.485, 0.456, 0.406];
-    const std = [0.229, 0.224, 0.225];
-
-    final h = patch.height;
-    final w = patch.width;
-    final buf = Float32List(3 * h * w);
-    int i = 0;
-    for (int c = 0; c < 3; c++) {
-      for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-          final p = patch.getPixel(x, y);
-          final r = getRed(p) / 255.0;
-          final g = getGreen(p) / 255.0;
-          final b = getBlue(p) / 255.0;
-          final v = c == 0
-              ? (r - mean[0]) / std[0]
-              : c == 1
-                  ? (g - mean[1]) / std[1]
-                  : (b - mean[2]) / std[2];
-          buf[i++] = v;
-        }
-      }
-    }
-    return OrtValueTensor.createTensorWithDataList(buf, [1, 3, h, w]);
-  }
+  return OrtValueTensor.createTensorWithDataList(buf, [1, 3, h, w]);
+}
 
   List<List<double>> _decodeAuto(List<OrtValue?> outs, _CropMeta meta) {
     if (outs.isEmpty || outs[0] == null) {
