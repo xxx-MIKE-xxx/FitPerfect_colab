@@ -28,14 +28,17 @@ import 'dart:ui' show Size;
 import 'package:path_provider/path_provider.dart';
 
 import 'ort_session.dart'; // OrtManager.fromAsset(...)
+import 'pipeline_debug_recorder.dart';
 
 class MotionBertRunner {
   MotionBertRunner({
     this.modelAssetPath = 'assets/models/motionbert_3d_243.onnx',
+    this.debug = false,
   });
 
   /// Path to MotionBERT ONNX/ORT model inside assets.
   final String modelAssetPath;
+  final bool debug;
 
   /// Run MotionBERT 3D for a finished live session.
   /// [frameSize] must match the original image size used during 2D (width x height).
@@ -57,138 +60,212 @@ class MotionBertRunner {
       await sessionDir.create(recursive: true);
     }
 
+    final PipelineDebugRecorder? dbg = debug
+        ? PipelineDebugRecorder(
+            enabled: true,
+            sessionId: sessionId,
+            sessionDir: sessionDir,
+          )
+        : null;
+
+    dbg?.log('SESSION_PATHS', {
+      'sessionId': sessionId,
+      'sessionDir': sessionDir.path,
+      'model': modelAssetPath,
+    });
+
     final file2D = File('${sessionDir.path}/coco_2d.jsonl');
     if (!await file2D.exists()) {
       throw StateError('Missing coco_2d.jsonl at ${file2D.path}');
     }
 
-    // --- 1) Read COCO-17 sequence from jsonl
-    final seqCoco = <List<List<double>>>[]; // [T][17][3]
-    await for (final line in file2D.openRead()
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())) {
-      if (line.trim().isEmpty) continue;
-      final obj = json.decode(line) as Map<String, dynamic>;
-      final kpts = (obj['kpt_coco'] as List)
-          .map<List<double>>((e) => (e as List).map((v) => (v as num).toDouble()).toList())
-          .toList();
-      if (kpts.length == 17) {
-        seqCoco.add(kpts);
-      }
-    }
-    if (seqCoco.isEmpty) {
-      throw StateError('No frames found in coco_2d.jsonl');
-    }
-
-    final int W = frameSize.width.round();
-    final int H = frameSize.height.round();
-
-    // --- 2) COCO-17 → H36M-17 (xy + conf per joint)
-    final seqH36 = <List<List<double>>>[]; // [T][17][3]
-    for (final kpts in seqCoco) {
-      final h36 = _cocoToH36M(kpts);
-      seqH36.add(h36);
-    }
-
-    // --- 3) Pad/trim to 243
-    const int T = 243;
-    List<List<List<double>>> seq = List.of(seqH36);
-    if (seq.length < T) {
-      final tail = seq.isNotEmpty ? seq.last : List.generate(17, (_) => [0.0, 0.0, 0.0]);
-      while (seq.length < T) {
-        seq.add(_deepCopyFrame(tail));
-      }
-    } else if (seq.length > T) {
-      // take last 243 frames
-      seq = seq.sublist(seq.length - T);
-    }
-
-    // --- 4) Normalize XY to [-1,1], keep conf
-    final Float32List mbIn = Float32List(T * 17 * 3);
-    final double s = (math.min(W, H) / 2.0);
-    final double cx = W / 2.0;
-    final double cy = H / 2.0;
-    int idx = 0;
-    for (int t = 0; t < T; t++) {
-      final fr = seq[t];
-      for (int j = 0; j < 17; j++) {
-        final x = (fr[j][0] - cx) / s;
-        final y = (fr[j][1] - cy) / s;
-        final c = fr[j][2];
-        mbIn[idx++] = x.toDouble();
-        mbIn[idx++] = y.toDouble();
-        mbIn[idx++] = c.toDouble();
-      }
-    }
-
-    // Optional: write mb_input_seq.npy (debug parity)
-    if (writeNpy) {
-      await _writeNpy('${sessionDir.path}/mb_input_seq.npy', mbIn, [T, 17, 3]);
-    }
-
-    // --- 5) Run MotionBERT ONNX
-    final dynamic mb = await OrtManager.fromAsset(modelAssetPath);
-    final Float32List mbInBatched = Float32List(1 * T * 17 * 3)..setAll(0, mbIn);
-    final dynamic out = await _runMb(mb, mbInBatched);
-    final Float32List flat = _asFloat32(out);
-
-    // Expect [1,T,17,3] → flatten length = 1*243*17*3
-    if (flat.length != 1 * T * 17 * 3) {
-      throw StateError('Unexpected MotionBERT output length: ${flat.length}');
-    }
-
-    // Parse to [T][17][3]
-    final List<List<List<double>>> X3D = List.generate(
-      T, (_) => List.generate(17, (_) => List.filled(3, 0.0)),
-    );
-    int p = 0;
-    for (int t = 0; t < T; t++) {
-      for (int j = 0; j < 17; j++) {
-        final x = flat[p++].toDouble();
-        final y = flat[p++].toDouble();
-        final z = flat[p++].toDouble();
-        X3D[t][j][0] = x;
-        X3D[t][j][1] = y;
-        X3D[t][j][2] = z;
-      }
-    }
-
-    // --- 6) Root-relative zeroing (pelvis joint 0)
-    if (rootRelative) {
-      for (int t = 0; t < T; t++) {
-        X3D[t][0][0] = 0.0;
-        X3D[t][0][1] = 0.0;
-        X3D[t][0][2] = 0.0;
-      }
-    }
-
-    // Optional: write mb_output_3d.npy
-    if (writeNpy) {
-      final Float32List outFlat = Float32List(T * 17 * 3);
-      int q = 0;
-      for (int t = 0; t < T; t++) {
-        for (int j = 0; j < 17; j++) {
-          outFlat[q++] = X3D[t][j][0].toDouble();
-          outFlat[q++] = X3D[t][j][1].toDouble();
-          outFlat[q++] = X3D[t][j][2].toDouble();
+    try {
+      // --- 1) Read COCO-17 sequence from jsonl
+      final seqCoco = <List<List<double>>>[]; // [T][17][3]
+      await for (final line in file2D.openRead()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
+        if (line.trim().isEmpty) continue;
+        final obj = json.decode(line) as Map<String, dynamic>;
+        final kpts = (obj['kpt_coco'] as List)
+            .map<List<double>>((e) => (e as List).map((v) => (v as num).toDouble()).toList())
+            .toList();
+        if (kpts.length == 17) {
+          seqCoco.add(kpts);
         }
       }
-      await _writeNpy('${sessionDir.path}/mb_output_3d.npy', outFlat, [T, 17, 3]);
-    }
+      if (seqCoco.isEmpty) {
+        throw StateError('No frames found in coco_2d.jsonl');
+      }
 
-    // --- 7) Save out_3d.json (compatible with your visualizer)
-    final outJson = {
-      "T": T,
-      "h36m_order": const [
-        "Pelvis","RHip","RKnee","RAnkle","LHip","LKnee","LAnkle",
-        "Spine1","Neck","Head","Site","LShoulder","LElbow","LWrist",
-        "RShoulder","RElbow","RWrist"
-      ],
-      "coords_3d": X3D,
-    };
-    final outFile = File('${sessionDir.path}/out_3d.json');
-    await outFile.writeAsString(const JsonEncoder.withIndent('  ').convert(outJson));
-    return outFile;
+      final int W = frameSize.width.round();
+      final int H = frameSize.height.round();
+
+      // --- 2) COCO-17 → H36M-17 (xy + conf per joint)
+      final seqH36 = <List<List<double>>>[]; // [T][17][3]
+      for (final kpts in seqCoco) {
+        final h36 = _cocoToH36M(kpts);
+        seqH36.add(h36);
+      }
+
+      // --- 3) Pad/trim to 243
+      const int T = 243;
+      List<List<List<double>>> seq = List.of(seqH36);
+      if (seq.length < T) {
+        final tail =
+            seq.isNotEmpty ? seq.last : List.generate(17, (_) => [0.0, 0.0, 0.0]);
+        while (seq.length < T) {
+          seq.add(_deepCopyFrame(tail));
+        }
+      } else if (seq.length > T) {
+        // take last 243 frames
+        seq = seq.sublist(seq.length - T);
+      }
+
+      // --- 4) Normalize XY to [-1,1], keep conf
+      final Float32List mbIn = Float32List(T * 17 * 3);
+      final double s = (math.min(W, H) / 2.0);
+      final double cx = W / 2.0;
+      final double cy = H / 2.0;
+      dbg?.log('MB_PREP', {
+        'sessionId': sessionId,
+        'frames': seqCoco.length,
+        'window': T,
+        'stride': 81,
+        'normalize': {
+          'center': [cx, cy],
+          'scale': s,
+        },
+      });
+      int idx = 0;
+      for (int t = 0; t < T; t++) {
+        final fr = seq[t];
+        for (int j = 0; j < 17; j++) {
+          final x = (fr[j][0] - cx) / s;
+          final y = (fr[j][1] - cy) / s;
+          final c = fr[j][2];
+          mbIn[idx++] = x.toDouble();
+          mbIn[idx++] = y.toDouble();
+          mbIn[idx++] = c.toDouble();
+        }
+      }
+
+      // Optional: write mb_input_seq.npy (debug parity)
+      if (writeNpy) {
+        await _writeNpy('${sessionDir.path}/mb_input_seq.npy', mbIn, [T, 17, 3]);
+      }
+
+      final loadTimer = Stopwatch()..start();
+      final dynamic mb = await OrtManager.fromAsset(modelAssetPath);
+      final double loadMs = loadTimer.elapsedMicroseconds / 1000.0;
+      dbg?.log('MB_EP', {
+        'sessionId': sessionId,
+        'model': modelAssetPath,
+        'providers': ['coreml', 'nnapi', 'xnnpack', 'cpu'],
+        'loadMs': double.parse(loadMs.toStringAsFixed(3)),
+      });
+
+      // --- 5) Run MotionBERT ONNX
+      final Float32List mbInBatched = Float32List(1 * T * 17 * 3)..setAll(0, mbIn);
+      final runTimer = Stopwatch()..start();
+      final dynamic out = await _runMb(mb, mbInBatched);
+      final double runMs = runTimer.elapsedMicroseconds / 1000.0;
+      dbg?.log('MB_RUN', {
+        'sessionId': sessionId,
+        'elapsedMs': double.parse(runMs.toStringAsFixed(3)),
+        'inputShape': [1, T, 17, 3],
+      });
+      final Float32List flat = _asFloat32(out);
+
+      // Expect [1,T,17,3] → flatten length = 1*243*17*3
+      if (flat.length != 1 * T * 17 * 3) {
+        throw StateError('Unexpected MotionBERT output length: ${flat.length}');
+      }
+
+      // Parse to [T][17][3]
+      final List<List<List<double>>> X3D = List.generate(
+        T, (_) => List.generate(17, (_) => List.filled(3, 0.0)),
+      );
+      double zMin = double.infinity;
+      double zMax = -double.infinity;
+      int p = 0;
+      for (int t = 0; t < T; t++) {
+        for (int j = 0; j < 17; j++) {
+          final x = flat[p++].toDouble();
+          final y = flat[p++].toDouble();
+          final z = flat[p++].toDouble();
+          X3D[t][j][0] = x;
+          X3D[t][j][1] = y;
+          X3D[t][j][2] = z;
+          zMin = math.min(zMin, z);
+          zMax = math.max(zMax, z);
+        }
+      }
+
+      // --- 6) Root-relative zeroing (pelvis joint 0)
+      if (rootRelative) {
+        for (int t = 0; t < T; t++) {
+          X3D[t][0][0] = 0.0;
+          X3D[t][0][1] = 0.0;
+          X3D[t][0][2] = 0.0;
+        }
+      }
+
+      dbg?.log('MB_OUT', {
+        'sessionId': sessionId,
+        'frames': T,
+        'z_min': double.parse(zMin.toStringAsFixed(4)),
+        'z_max': double.parse(zMax.toStringAsFixed(4)),
+      });
+
+      if (dbg != null && dbg.enabled) {
+        final stats = {
+          'frames_2d': seqCoco.length,
+          'window': T,
+          'stride': 81,
+          'z_min': zMin,
+          'z_max': zMax,
+        };
+        await dbg.saveText(
+          'mb_quick_stats.json',
+          const JsonEncoder.withIndent('  ').convert(stats),
+        );
+      }
+
+      // Optional: write mb_output_3d.npy
+      if (writeNpy) {
+        final Float32List outFlat = Float32List(T * 17 * 3);
+        int q = 0;
+        for (int t = 0; t < T; t++) {
+          for (int j = 0; j < 17; j++) {
+            outFlat[q++] = X3D[t][j][0].toDouble();
+            outFlat[q++] = X3D[t][j][1].toDouble();
+            outFlat[q++] = X3D[t][j][2].toDouble();
+          }
+        }
+        await _writeNpy('${sessionDir.path}/mb_output_3d.npy', outFlat, [T, 17, 3]);
+      }
+
+      // --- 7) Save out_3d.json (compatible with your visualizer)
+      final outJson = {
+        "T": T,
+        "h36m_order": const [
+          "Pelvis","RHip","RKnee","RAnkle","LHip","LKnee","LAnkle",
+          "Spine1","Neck","Head","Site","LShoulder","LElbow","LWrist",
+          "RShoulder","RElbow","RWrist"
+        ],
+        "coords_3d": X3D,
+      };
+      final outFile = File('${sessionDir.path}/out_3d.json');
+      await outFile.writeAsString(const JsonEncoder.withIndent('  ').convert(outJson));
+      dbg?.log('MB_OUT_FILE', {
+        'sessionId': sessionId,
+        'path': outFile.path,
+      });
+      return outFile;
+    } finally {
+      await dbg?.close();
+    }
   }
 
   // ---------- helpers ----------
