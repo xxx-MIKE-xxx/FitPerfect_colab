@@ -1,7 +1,14 @@
 // lib/screens/feedback_summary_screen.dart
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' show Size;
+
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:path_provider/path_provider.dart';
+
+import '../shared/services/pose_processing_controller.dart';
 import '../shared/services/summary_repository.dart';
 
 class FeedbackSummaryScreen extends StatefulWidget {
@@ -24,11 +31,39 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
   Map<String, dynamic>? _summary;
   Object? _error;
   String _filter = 'all'; // all | severe | mild
+  String? _sessionId;
+  String? _out3dPath;
+  Map<String, dynamic>? _mbSummary;
+  List<String> _logTail = const [];
+  bool _loading3D = false;
+  bool _retrying3D = false;
+  String? _mbError;
 
   @override
   void initState() {
     super.initState();
     _load();
+
+    final rep = widget.localReport;
+    final repSession = rep?['sessionId'];
+    final repOut3d = rep?['out3dPath'];
+    if (repSession is String) {
+      _sessionId = repSession;
+    } else if (repSession != null) {
+      _sessionId = repSession.toString();
+    }
+    if (repOut3d is String) {
+      _out3dPath = repOut3d;
+    } else if (repOut3d != null) {
+      _out3dPath = repOut3d.toString();
+    }
+
+    if (_out3dPath != null) {
+      _loading3D = true;
+      _load3D(_out3dPath!);
+    } else {
+      _loadLogTail();
+    }
   }
 
   Future<void> _load() async {
@@ -38,10 +73,344 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
         exerciseId: widget.exerciseId,
         localReport: widget.localReport,
       );
-      setState(() => _summary = json);
+      if (!mounted) return;
+      final summarySession = json['sessionId'];
+      final summaryOut3d = json['out3dPath'];
+      setState(() {
+        _summary = json;
+        _sessionId ??=
+            summarySession is String ? summarySession : summarySession?.toString();
+        _out3dPath ??=
+            summaryOut3d is String ? summaryOut3d : summaryOut3d?.toString();
+      });
+
+      if (_out3dPath != null &&
+          (_mbSummary == null || _mbSummary?['path'] != _out3dPath)) {
+        _load3D(_out3dPath!);
+      } else if (_out3dPath == null && _sessionId != null && _logTail.isEmpty) {
+        _loadLogTail();
+      }
     } catch (e) {
+      if (!mounted) return;
       setState(() => _error = e);
     }
+  }
+
+  Future<void> _loadLogTail() async {
+    final sid = _sessionId;
+    if (sid == null) return;
+
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final file = File('${docs.path}/FitPerfect/$sid/coco_2d.jsonl');
+      if (!await file.exists()) {
+        if (!mounted) return;
+        setState(() {
+          _logTail = const ['coco_2d.jsonl not found'];
+        });
+        return;
+      }
+
+      final lines = await file.readAsLines();
+      final tailCount = 10;
+      final tail = lines.length <= tailCount
+          ? lines
+          : lines.sublist(lines.length - tailCount, lines.length);
+      if (!mounted) return;
+      setState(() {
+        _logTail = tail;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _logTail = ['Error reading coco_2d.jsonl: $e'];
+      });
+    }
+  }
+
+  Future<void> _load3D(String path) async {
+    if (mounted) {
+      setState(() {
+        _loading3D = true;
+        _mbError = null;
+      });
+    } else {
+      _loading3D = true;
+      _mbError = null;
+    }
+
+    try {
+      final file = File(path);
+      if (!await file.exists()) {
+        throw 'out_3d.json missing at $path';
+      }
+
+      final str = await file.readAsString();
+      final data = jsonDecode(str) as Map<String, dynamic>;
+      final coords = data['coords_3d'] as List<dynamic>?;
+      if (coords == null || coords.isEmpty) {
+        throw 'coords_3d missing or empty';
+      }
+
+      final frames = coords.length;
+      final firstFrame = coords.first;
+      final joints = firstFrame is List ? firstFrame.length : 0;
+      double minZ = double.infinity;
+      double maxZ = -double.infinity;
+
+      for (final frame in coords) {
+        if (frame is! List) continue;
+        for (final joint in frame) {
+          if (joint is! List || joint.length < 3) continue;
+          final z = (joint[2] as num).toDouble();
+          if (z < minZ) minZ = z;
+          if (z > maxZ) maxZ = z;
+        }
+      }
+
+      final summary = <String, dynamic>{
+        'frames': frames,
+        'joints': joints,
+        'zMin': minZ.isFinite ? minZ : null,
+        'zMax': maxZ.isFinite ? maxZ : null,
+        'path': path,
+      };
+
+      if (!mounted) return;
+      setState(() {
+        _out3dPath = path;
+        _mbSummary = summary;
+        _loading3D = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _mbSummary = null;
+        _loading3D = false;
+        _mbError = 'Failed to load 3D analysis: $e';
+      });
+    }
+  }
+
+  Future<void> _retry3D() async {
+    final sid = _sessionId;
+    if (sid == null || _retrying3D) return;
+
+    if (mounted) {
+      setState(() {
+        _retrying3D = true;
+        _mbError = null;
+        _loading3D = true;
+      });
+    } else {
+      _retrying3D = true;
+      _mbError = null;
+      _loading3D = true;
+    }
+
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('${docs.path}/FitPerfect/$sid');
+      final file = File('${dir.path}/coco_2d.jsonl');
+      if (!await file.exists()) {
+        throw 'coco_2d.jsonl missing for session $sid';
+      }
+
+      final lines = await file.readAsLines();
+      int? imgW;
+      int? imgH;
+      for (final ln in lines) {
+        final trimmed = ln.trim();
+        if (trimmed.isEmpty) continue;
+        try {
+          final obj = jsonDecode(trimmed) as Map<String, dynamic>;
+          if (obj.containsKey('img_w') && obj.containsKey('img_h')) {
+            imgW = (obj['img_w'] as num).toInt();
+            imgH = (obj['img_h'] as num).toInt();
+            break;
+          }
+        } catch (_) {
+          continue;
+        }
+      }
+
+      final ctl = PoseProcessingController();
+      final out = await ctl.run3DForSession(
+        sid,
+        Size((imgW ?? 640).toDouble(), (imgH ?? 480).toDouble()),
+      );
+
+      if (out == null) {
+        throw '3D processing returned null';
+      }
+
+      _out3dPath = out.path;
+      await _load3D(out.path);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _mbError = 'Retry failed: $e';
+      });
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _retrying3D = false;
+        _loading3D = false;
+      });
+    }
+  }
+
+  Widget _build3DSection(BuildContext context) {
+    final theme = Theme.of(context);
+    final summary = _mbSummary;
+    if (summary == null) {
+      return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.auto_graph),
+                  const SizedBox(width: 8),
+                  Text('3D Analysis', style: theme.textTheme.titleMedium),
+                  const Spacer(),
+                  if (_loading3D || _retrying3D)
+                    const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Text('Frames: ${summary['frames']}'),
+              Text('Joints: ${summary['joints']}'),
+              Text(
+                'Z range: '
+                '${(summary['zMin'] as num?)?.toStringAsFixed(3) ?? '—'} .. '
+                '${(summary['zMax'] as num?)?.toStringAsFixed(3) ?? '—'}',
+              ),
+              const SizedBox(height: 12),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  FilledButton.icon(
+                    onPressed: () {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('3D viewer coming soon')),
+                      );
+                    },
+                    icon: const Icon(Icons.view_in_ar),
+                    label: const Text('Open 3D viewer'),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      '${summary['path']}',
+                      style: theme.textTheme.bodySmall,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+              if (_mbError != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  _mbError!,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.error,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _build3DRetrySection(BuildContext context) {
+    final theme = Theme.of(context);
+    final canRetry = _sessionId != null && !_retrying3D;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.threed_rotation),
+                  const SizedBox(width: 8),
+                  Text('3D Analysis', style: theme.textTheme.titleMedium),
+                  const Spacer(),
+                  if (_retrying3D || _loading3D)
+                    const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Text(
+                _sessionId == null
+                    ? 'Session information unavailable.'
+                    : 'No 3D result yet for session $_sessionId.',
+              ),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: canRetry ? _retry3D : null,
+                icon: const Icon(Icons.refresh),
+                label: Text(_retrying3D ? 'Retrying…' : 'Retry 3D'),
+              ),
+              if (_mbError != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  _mbError!,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.error,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              Text(
+                'coco_2d.jsonl tail',
+                style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceVariant.withOpacity(0.4),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                padding: const EdgeInsets.all(12),
+                child: Text(
+                  _logTail.isEmpty
+                      ? 'No log data available.'
+                      : _logTail.join('\n'),
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -52,11 +421,22 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
       appBar: AppBar(title: const Text('Feedback summary')),
       body: data == null
           ? const Center(child: CircularProgressIndicator())
-          : _Content(
-              exerciseId: widget.exerciseId,
-              summary: data,
-              filter: _filter,
-              onFilterChanged: (f) => setState(() => _filter = f),
+          : Column(
+              children: [
+                if (_out3dPath != null && _mbSummary != null) ...[
+                  _build3DSection(context),
+                ] else ...[
+                  _build3DRetrySection(context),
+                ],
+                Expanded(
+                  child: _Content(
+                    exerciseId: widget.exerciseId,
+                    summary: data,
+                    filter: _filter,
+                    onFilterChanged: (f) => setState(() => _filter = f),
+                  ),
+                ),
+              ],
             ),
     );
   }
