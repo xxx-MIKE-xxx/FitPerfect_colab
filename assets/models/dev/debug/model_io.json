@@ -1,0 +1,52 @@
+{
+  "yolo_inputs": [
+    [
+      "images",
+      [
+        1,
+        3,
+        640,
+        640
+      ]
+    ]
+  ],
+  "yolo_outputs": [
+    [
+      "output0",
+      [
+        1,
+        84,
+        8400
+      ]
+    ]
+  ],
+  "rtmpose_inputs": [
+    [
+      "input",
+      [
+        "batch",
+        3,
+        256,
+        192
+      ]
+    ]
+  ],
+  "rtmpose_outputs": [
+    [
+      "simcc_x",
+      [
+        "batch",
+        "MatMulsimcc_x_dim_1",
+        384
+      ]
+    ],
+    [
+      "simcc_y",
+      [
+        "batch",
+        "MatMulsimcc_x_dim_1",
+        512
+      ]
+    ]
+  ]
+}

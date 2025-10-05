@@ -1,0 +1,9 @@
+=== Runtime Introspect ===
+time: 2025-10-05 09:04:51
+python: 3.12.9 | packaged by Anaconda, Inc. | (main, Feb  6 2025, 13:04:33) [Clang 14.0.6 ]
+platform: macOS-10.16-x86_64-i386-64bit
+numpy: 1.26.4
+opencv: 4.10.0
+onnxruntime: 1.17.0
+available_providers: ['CoreMLExecutionProvider', 'AzureExecutionProvider', 'CPUExecutionProvider']
+video: far_away.mp4

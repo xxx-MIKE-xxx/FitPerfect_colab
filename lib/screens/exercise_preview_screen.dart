@@ -34,6 +34,7 @@ import '../shared/services/s3_uploader.dart';
 import '../shared/services/video_transcoder.dart'; // 10fps helper
 import '../shared/widgets/live_skeleton_overlay.dart';
 import '../shared/widgets/processing_banner.dart';
+import 'package:fit_perfect_v2/shared/services/live_pose.dart';
 
 class ExercisePreviewScreen extends StatefulWidget {
   const ExercisePreviewScreen({super.key, required this.exerciseId});
@@ -76,7 +77,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   DateTime? _recordingStartedAt;
 
   /* ───────────── live 2D pose state ───────────── */
-  final LivePoseEngine _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
+  final LivePoseEngine _engine = LivePoseEngine(frameStride: 5, roiMargin: 1.25);
   bool _streaming = false;
   bool _runningEst = false; // simple reentrancy guard
   bool _poseOk = false; // true when detected 2D matches desired pose

@@ -1,0 +1,14 @@
+{
+  "frames": 1160,
+  "coco_conf_mean": 0.002607127884402871,
+  "coco_x_ptp": 0.9973958730697632,
+  "coco_y_ptp": 2.99609375,
+  "seen_person": true,
+  "per_joint_pixel_std_mean_xy": [
+    0.012896301224827766,
+    0.0879034623503685
+  ],
+  "frames_used": 243,
+  "pixel_mode": false,
+  "wrap_pad": true
+}

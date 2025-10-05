@@ -1,0 +1,13 @@
+== YOLOv8 I/O ==
+IN[0] images [1, 3, 640, 640] tensor(float)
+OUT[0] output0 [1, 84, 8400] tensor(float)
+
+== RTMPose I/O ==
+IN[0] input ['batch', 3, 256, 192] tensor(float)
+OUT[0] simcc_x ['batch', 'MatMulsimcc_x_dim_1', 384] tensor(float)
+OUT[1] simcc_y ['batch', 'MatMulsimcc_x_dim_1', 512] tensor(float)
+
+== MotionBERT I/O ==
+IN[0] input [1, 243, 17, 3] tensor(float)
+OUT[0] output [1, 243, 17, 3] tensor(float)
+

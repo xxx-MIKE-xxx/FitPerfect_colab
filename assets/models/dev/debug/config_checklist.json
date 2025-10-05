@@ -1,0 +1,42 @@
+{
+  "yolo": {
+    "input.shape_runtime": [
+      1,
+      3,
+      640,
+      640
+    ],
+    "output.shape_runtime": [
+      1,
+      84,
+      8400
+    ],
+    "output.shape_hint": [
+      1,
+      84,
+      8400
+    ],
+    "domain.units": "normalized",
+    "domain.coords": "letterbox",
+    "class_activation": "sigmoid",
+    "person_id": 0
+  },
+  "rtmpose": {
+    "input.shape_runtime": [
+      "batch",
+      3,
+      256,
+      192
+    ],
+    "output.heads": [
+      "simcc_x",
+      "simcc_y"
+    ],
+    "preprocess.mode": "rgb_255",
+    "simcc.split_ratio": 2.0
+  },
+  "motionbert": {
+    "input.sequence_length": 243,
+    "output.root_relative": true
+  }
+}

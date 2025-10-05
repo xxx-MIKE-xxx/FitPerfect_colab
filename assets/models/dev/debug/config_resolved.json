@@ -1,0 +1,22 @@
+{
+  "cfg_yolo": "yolo.cfg",
+  "cfg_rtm": "rtm.cfg",
+  "cfg_mb": "motionbert.cfg",
+  "debug": true,
+  "video": "far_away.mp4",
+  "out": "out_3d.json",
+  "debug_dir": "debug",
+  "save_overlay": true,
+  "overlay_start": 0,
+  "yolo": "../yolov8n.onnx",
+  "rtmpose": "../rtmpose-m_256x192.onnx",
+  "motionbert": "../motionbert_3d_243.onnx",
+  "providers": "['CPUExecutionProvider']",
+  "person_conf": 0.25,
+  "person_iou": 0.45,
+  "rtm_preproc": "rgb_255",
+  "simcc_ratio": 2.0,
+  "dump_crops": 4,
+  "wrap_pad": true,
+  "rootrel": true
+}

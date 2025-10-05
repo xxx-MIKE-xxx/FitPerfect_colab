@@ -1,0 +1,22 @@
+{
+  "xywh_pixels": {
+    "frames": 300,
+    "has_person": 0,
+    "valid_boxes": 0
+  },
+  "xyxy_pixels": {
+    "frames": 300,
+    "has_person": 0,
+    "valid_boxes": 0
+  },
+  "xywh_norm": {
+    "frames": 300,
+    "has_person": 300,
+    "valid_boxes": 421756
+  },
+  "xyxy_norm": {
+    "frames": 300,
+    "has_person": 300,
+    "valid_boxes": 487010
+  }
+}
