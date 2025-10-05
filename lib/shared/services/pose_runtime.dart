@@ -195,6 +195,9 @@ class PosePipeline {
   OrtSession? _rtm;
   OrtSession? _mb;
   MotionBertConfig? _mbConfig;
+  double _personScoreThr = 0.25;
+  double _iouThr = 0.45;
+  double _cropScale = 1.25;
 
   Future<void> _ensure2DModelsLoaded() async {
     _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
@@ -264,8 +267,15 @@ class PosePipeline {
     File video, {
     double targetFps = 10.0,
     bool Function()? shouldAbort,
+    double personScore = 0.25,
+    double iouThreshold = 0.45,
+    double cropScale = 1.25,
   }) async {
     await _ensure2DModelsLoaded();
+
+    _personScoreThr = personScore;
+    _iouThr = iouThreshold;
+    _cropScale = cropScale;
 
     final frames = await VideoSampler.extract10FpsJpgs(video);
     final results = <Pose2DFrame>[];
@@ -289,10 +299,10 @@ class PosePipeline {
       if (det == null) {
         h36m = List.generate(17, (_) => [0.0, 0.0, 0.0]);
       } else {
-        final crop = _cropForRtm(jpg, det, outH: 256, outW: 192);
+        final crop = _cropForRtm(image, det, outH: 256, outW: 192, scale: _cropScale);
         final rtmIn = _prepRtm(crop.image);
         final rtmOuts = await _run(_rtm!, {'input': rtmIn});
-        final raw = _decodeAuto(rtmOuts, crop.meta);
+        final raw = _decodeAuto(rtmOuts, crop);
         h36m = _remapToH36M(raw);
       }
 
@@ -459,254 +469,449 @@ class PosePipeline {
     return outs ?? const [];
   }
 
-  
-OrtValue _prepYolo(img.Image im) {
-  // Store original dims
-  _origW = im.width;
-  _origH = im.height;
+  OrtValue _prepYolo(img.Image im) {
+    _origW = im.width;
+    _origH = im.height;
 
-  // Letterbox to 640x640 with pad 114, keep scale/offsets
-  const tw = 640, th = 640;
-  final r = math.min(th / _origH, tw / _origW);
-  final newW = (_origW * r).round();
-  final newH = (_origH * r).round();
-  final resized = img.copyResize(im, width: newW, height: newH, interpolation: img.Interpolation.nearest);
-  final canvas = img.Image(width: tw, height: th);
-  // fill with 114 gray
-  img.fill(canvas, color: img.ColorRgb8(114, 114, 114));
-  final left = ((tw - newW) / 2).floor();
-  final top  = ((th - newH) / 2).floor();
-  img.compositeImage(canvas, resized, dstX: left, dstY: top, dstW: newW, dstH: newH, blend: img.BlendMode.direct);
+    const tw = 640, th = 640;
+    final r = math.min(th / _origH, tw / _origW);
+    final newW = (_origW * r).round();
+    final newH = (_origH * r).round();
+    final resized = img.copyResize(
+      im,
+      width: newW,
+      height: newH,
+      interpolation: img.Interpolation.cubic,
+    );
+    final canvas = img.Image(width: tw, height: th);
+    img.fill(canvas, color: img.ColorRgb8(114, 114, 114));
+    final left = ((tw - newW) / 2).floor();
+    final top = ((th - newH) / 2).floor();
+    img.compositeImage(
+      canvas,
+      resized,
+      dstX: left,
+      dstY: top,
+      dstW: newW,
+      dstH: newH,
+      blend: img.BlendMode.direct,
+    );
 
-  // Save letterbox meta for unmapping
-  _lbR = r;
-  _lbDw = left.toDouble();
-  _lbDh = top.toDouble();
-  _lbW = tw;
-  _lbH = th;
+    _lbR = r;
+    _lbDw = left.toDouble();
+    _lbDh = top.toDouble();
+    _lbW = tw;
+    _lbH = th;
 
-  // Export CHW float32 in RGB/255
-  final w = canvas.width;
-  final h = canvas.height;
-  final plane = w * h;
-  final buf = Float32List(3 * plane);
-  final bytes = canvas.getBytes(order: img.ChannelOrder.rgb);
-  for (int i = 0, p = 0; p < plane; p++) {
-    final r8 = bytes[i++] / 255.0;
-    final g8 = bytes[i++] / 255.0;
-    final b8 = bytes[i++] / 255.0;
-    buf[p] = r8;
-    buf[plane + p] = g8;
-    buf[(plane << 1) + p] = b8;
+    final plane = canvas.width * canvas.height;
+    final buf = Float32List(3 * plane);
+    for (int y = 0; y < canvas.height; y++) {
+      for (int x = 0; x < canvas.width; x++) {
+        final pixel = canvas.getPixel(x, y);
+        final idx = y * canvas.width + x;
+        buf[idx] = img.getRed(pixel) / 255.0;
+        buf[plane + idx] = img.getGreen(pixel) / 255.0;
+        buf[(plane * 2) + idx] = img.getBlue(pixel) / 255.0;
+      }
+    }
+    return OrtValueTensor.createTensorWithDataList(buf, [1, 3, canvas.height, canvas.width]);
   }
-  return OrtValueTensor.createTensorWithDataList(buf, [1, 3, h, w]);
-}
 
-_Det? _pickBestPerson(OrtValue out) {
-  // Expect Ultralytics YOLOv8: [1, 84, N] (4 box + 80 classes).
-  // Some exports may be [1, N, 84]; handle both.
-  final v = out.value;
-  if (v is! List || v.isEmpty) return null;
-  final l0 = v[0];
-  if (l0 is! List || l0.isEmpty) return null;
+  _Det? _pickBestPerson(OrtValue out) {
+    final raw = out.value;
+    final shape = _shapeOf(raw);
+    if (shape.length != 3 || shape[0] != 1) {
+      return null;
+    }
 
-  // Convert to [N,84] double array
-  List<List<double>> arr;
-  // Try [84, N]
-  bool parsed = false;
-  try {
-    final chans = (v[0] as List);
-    final C = chans.length;
-    final N = (chans[0] as List).length;
-    if (C == 84) {
-      arr = List.generate(N, (i) {
-        final row = List<double>.filled(C, 0.0);
-        for (int c = 0; c < C; c++) {
-          row[c] = ((chans[c] as List)[i] as num).toDouble();
+    List<List<double>> rows = const [];
+    if (shape[1] == 84) {
+      final channels = (raw as List)[0] as List;
+      final count = shape[2];
+      rows = List.generate(count, (i) {
+        final row = List<double>.filled(84, 0.0);
+        for (int c = 0; c < 84; c++) {
+          row[c] = ((channels[c] as List)[i] as num).toDouble();
         }
         return row;
       });
-      parsed = true;
+    } else if (shape[2] == 84) {
+      rows = ((raw as List)[0] as List)
+          .map<List<double>>(
+              (row) => (row as List).map((e) => (e as num).toDouble()).toList())
+          .toList();
     } else {
-      arr = const [];
+      return null;
     }
-  } catch (_) {
-    arr = const [];
-  }
-  if (!parsed) {
-    // Fallback: assume [N,84]
-    final rows = (v[0] as List);
-    arr = rows
-        .map<List<double>>((row) =>
-            (row as List).map((e) => (e as num).toDouble()).toList())
-        .toList();
-  }
 
-  // Select best person by class 0 score
-  const int personClass = 0;
-  double bestScore = -1.0;
-  _Det? best;
-  for (final r in arr) {
-    if (r.length < 84) continue;
-    final cx = r[0];
-    final cy = r[1];
-    final w = r[2];
-    final h = r[3];
-    final clsLogit = r[4 + personClass];
-    final score = 1.0 / (1.0 + math.exp(-clsLogit)); // sigmoid
-    if (score < 0.25) continue;
+    if (rows.isEmpty) return null;
 
-    // xywh (letterbox space)
-    double x1 = cx - w / 2.0;
-    double y1 = cy - h / 2.0;
-    double x2 = cx + w / 2.0;
-    double y2 = cy + h / 2.0;
+    final boxes = <List<double>>[];
+    final scores = <double>[];
+    for (final row in rows) {
+      if (row.length < 84) continue;
+      final score = 1.0 / (1.0 + math.exp(-row[4]));
+      if (score < _personScoreThr) continue;
 
-    // Map from letterbox -> original image
-    double ox1 = (x1 - _lbDw) / _lbR;
-    double oy1 = (y1 - _lbDh) / _lbR;
-    double ox2 = (x2 - _lbDw) / _lbR;
-    double oy2 = (y2 - _lbDh) / _lbR;
+      final cx = row[0];
+      final cy = row[1];
+      final w = row[2];
+      final h = row[3];
 
-    // Clip
-    ox1 = ox1.clamp(0.0, _origW.toDouble());
-    oy1 = oy1.clamp(0.0, _origH.toDouble());
-    ox2 = ox2.clamp(0.0, _origW.toDouble());
-    oy2 = oy2.clamp(0.0, _origH.toDouble());
-    if (ox2 <= ox1 || oy2 <= oy1) continue;
+      final x1 = cx - w / 2.0;
+      final y1 = cy - h / 2.0;
+      final x2 = cx + w / 2.0;
+      final y2 = cy + h / 2.0;
 
-    if (score > bestScore) {
-      bestScore = score;
-      best = _Det(ox1, oy1, ox2, oy2, score);
+      final ox1 = (x1 - _lbDw) / _lbR;
+      final oy1 = (y1 - _lbDh) / _lbR;
+      final ox2 = (x2 - _lbDw) / _lbR;
+      final oy2 = (y2 - _lbDh) / _lbR;
+
+      final clamped = <double>[
+        ox1.clamp(0.0, _origW.toDouble()),
+        oy1.clamp(0.0, _origH.toDouble()),
+        ox2.clamp(0.0, _origW.toDouble()),
+        oy2.clamp(0.0, _origH.toDouble()),
+      ];
+      if (clamped[2] <= clamped[0] || clamped[3] <= clamped[1]) {
+        continue;
+      }
+      boxes.add(clamped);
+      scores.add(score);
     }
+
+    if (boxes.isEmpty) return null;
+
+    final keep = _nms(boxes, scores, _iouThr, 50);
+    if (keep.isEmpty) return null;
+    final bestIdx = keep.first;
+    final b = boxes[bestIdx];
+    return _Det(b[0], b[1], b[2], b[3], scores[bestIdx]);
   }
 
-OrtValue _prepRtm(img.Image patch) {
-  final h = patch.height;
-  final w = patch.width;
-  final buf = Float32List(3 * h * w);
-  int i = 0;
-  for (int c = 0; c < 3; c++) {
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        final p = patch.getPixel(x, y);
-        final r = img.getRed(p) / 255.0;
-        final g = img.getGreen(p) / 255.0;
-        final b = img.getBlue(p) / 255.0;
-        final v = c == 0 ? r : (c == 1 ? g : b);
-        buf[i++] = v;
+  List<int> _shapeOf(Object? v) {
+    final dims = <int>[];
+    Object? current = v;
+    while (current is List && current.isNotEmpty) {
+      dims.add(current.length);
+      current = current.first;
+    }
+    if (current is List && current.isEmpty) {
+      dims.add(0);
+    }
+    return dims;
+  }
+
+  _CropResult _cropForRtm(
+    img.Image im,
+    _Det det, {
+    int outH = 256,
+    int outW = 192,
+    double scale = 1.25,
+  }) {
+    final cx = (det.x1 + det.x2) / 2.0;
+    final cy = (det.y1 + det.y2) / 2.0;
+    final boxW = math.max(1.0, det.x2 - det.x1);
+    final boxH = math.max(1.0, det.y2 - det.y1);
+
+    final desiredAspect = outW / outH;
+    double targetW = boxW * scale;
+    double targetH = boxH * scale;
+    final currentAspect = targetW / targetH;
+    if (currentAspect > desiredAspect) {
+      targetH = targetW / desiredAspect;
+    } else {
+      targetW = targetH * desiredAspect;
+    }
+
+    double x1 = cx - targetW / 2.0;
+    double y1 = cy - targetH / 2.0;
+    double x2 = cx + targetW / 2.0;
+    double y2 = cy + targetH / 2.0;
+
+    final maxX = im.width.toDouble();
+    final maxY = im.height.toDouble();
+
+    if (x1 < 0) {
+      x2 -= x1;
+      x1 = 0;
+    }
+    if (y1 < 0) {
+      y2 -= y1;
+      y1 = 0;
+    }
+    if (x2 > maxX) {
+      final diff = x2 - maxX;
+      x1 = math.max(0.0, x1 - diff);
+      x2 = maxX;
+    }
+    if (y2 > maxY) {
+      final diff = y2 - maxY;
+      y1 = math.max(0.0, y1 - diff);
+      y2 = maxY;
+    }
+
+    if (x2 <= x1 || y2 <= y1) {
+      final resized = img.copyResize(
+        im,
+        width: outW,
+        height: outH,
+        interpolation: img.Interpolation.cubic,
+      );
+      return _CropResult(
+        image: resized,
+        x: 0.0,
+        y: 0.0,
+        w: im.width.toDouble(),
+        h: im.height.toDouble(),
+        outW: outW,
+        outH: outH,
+      );
+    }
+
+    final cropX = x1.floor();
+    final cropY = y1.floor();
+    int desiredW = (x2 - x1).round();
+    int desiredH = (y2 - y1).round();
+    if (desiredW < 1) desiredW = 1;
+    if (desiredH < 1) desiredH = 1;
+    int remainingW = im.width - cropX;
+    int remainingH = im.height - cropY;
+    if (remainingW < 1) remainingW = 1;
+    if (remainingH < 1) remainingH = 1;
+    final cropW = remainingW < desiredW ? remainingW : desiredW;
+    final cropH = remainingH < desiredH ? remainingH : desiredH;
+    final cropped = img.copyCrop(
+      im,
+      x: cropX,
+      y: cropY,
+      width: cropW,
+      height: cropH,
+    );
+    final resized = img.copyResize(
+      cropped,
+      width: outW,
+      height: outH,
+      interpolation: img.Interpolation.cubic,
+    );
+
+    return _CropResult(
+      image: resized,
+      x: cropX.toDouble(),
+      y: cropY.toDouble(),
+      w: cropped.width.toDouble(),
+      h: cropped.height.toDouble(),
+      outW: outW,
+      outH: outH,
+    );
+  }
+
+  OrtValue _prepRtm(img.Image patch) {
+    final plane = patch.width * patch.height;
+    final buf = Float32List(3 * plane);
+    for (int y = 0; y < patch.height; y++) {
+      for (int x = 0; x < patch.width; x++) {
+        final pixel = patch.getPixel(x, y);
+        final idx = y * patch.width + x;
+        buf[idx] = img.getRed(pixel) / 255.0;
+        buf[plane + idx] = img.getGreen(pixel) / 255.0;
+        buf[(plane * 2) + idx] = img.getBlue(pixel) / 255.0;
       }
     }
+    return OrtValueTensor.createTensorWithDataList(
+      buf,
+      [1, 3, patch.height, patch.width],
+    );
   }
-  return OrtValueTensor.createTensorWithDataList(buf, [1, 3, h, w]);
-}
 
-  List<List<double>> _decodeAuto(List<OrtValue?> outs, _CropMeta meta) {
+  List<List<double>> _decodeAuto(List<OrtValue?> outs, _CropResult crop) {
     if (outs.isEmpty || outs[0] == null) {
       return List.generate(17, (_) => [0.0, 0.0, 0.0]);
     }
 
-    final v0 = outs[0]!.value;
-    final s0 = _shapeOf(v0);
-
-    if (s0.length == 4) {
-      return _decodeHeatmap(outs[0]!, meta);
+    final primary = outs[0]!;
+    final shape0 = _shapeOf(primary.value);
+    if (shape0.length == 4) {
+      return _decodeHeatmap(primary, crop);
     }
 
     if (outs.length >= 2) {
-      final s1 = _shapeOf(outs[1]!.value);
-      final looksSimCC =
-          s0.length == 3 && s1.length == 3 && s0[0] == 1 && s1[0] == 1;
-      if (looksSimCC) {
-        final xFirst = s0.last <= s1.last;
-        return _decodeSimCC(xFirst ? outs : [outs[1], outs[0]], meta);
+      final secondary = outs[1]!;
+      final shape1 = _shapeOf(secondary.value);
+      final looksSimcc =
+          shape0.length == 3 && shape1.length == 3 && shape0[0] == 1 && shape1[0] == 1;
+      if (looksSimcc) {
+        final firstIsX = shape0[2] <= shape1[2];
+        final ordered = firstIsX ? outs : [outs[1], outs[0]];
+        return _decodeSimCC(ordered, crop);
       }
     }
 
-    return _decodeHeatmap(outs[0]!, meta);
+    return _decodeHeatmap(primary, crop);
   }
 
-  List<List<double>> _decodeSimCC(List<OrtValue?> outs, _CropMeta meta) {
-    final simccX = _toList3D(outs[0]!.value);
-    final simccY = _toList3D(outs[1]!.value);
-    const split = 2.0;
-
-    final List<List<double>> kpts =
-        List.generate(17, (_) => [0.0, 0.0, 0.0]);
-    for (int j = 0; j < 17; j++) {
-      final rowX = simccX[0][j];
-      final rowY = simccY[0][j];
-      int ix = 0, iy = 0;
-      double vx = -1e9, vy = -1e9;
-      for (int t = 0; t < rowX.length; t++) {
-        if (rowX[t] > vx) {
-          vx = rowX[t];
-          ix = t;
-        }
-      }
-      for (int t = 0; t < rowY.length; t++) {
-        if (rowY[t] > vy) {
-          vy = rowY[t];
-          iy = t;
-        }
-      }
-      final px = ix / split;
-      final py = iy / split;
-      final x = meta.roiX + (px / meta.outW) * meta.roiW;
-      final y = meta.roiY + (py / meta.outH) * meta.roiH;
-      final conf = math.min(1.0, math.max(0.0, (vx + vy) / 2.0));
-      kpts[j][0] = x;
-      kpts[j][1] = y;
-      kpts[j][2] = conf;
+  List<List<double>> _decodeSimCC(List<OrtValue?> outs, _CropResult crop) {
+    final xVal = outs[0]!.value as List;
+    final yVal = outs[1]!.value as List;
+    if (xVal.isEmpty || yVal.isEmpty) {
+      return List.generate(17, (_) => [0.0, 0.0, 0.0]);
     }
-    return kpts;
+    final xData = xVal[0] as List;
+    final yData = yVal[0] as List;
+    final joints = math.min(17, xData.length);
+    final Wx = (xData.first as List).length;
+    final Hy = (yData.first as List).length;
+    final flatX = Float32List(joints * Wx);
+    final flatY = Float32List(joints * Hy);
+    for (int j = 0; j < joints; j++) {
+      final rowX = xData[j] as List;
+      final rowY = yData[j] as List;
+      for (int i = 0; i < Wx; i++) {
+        flatX[j * Wx + i] = (rowX[i] as num).toDouble();
+      }
+      for (int i = 0; i < Hy; i++) {
+        flatY[j * Hy + i] = (rowY[i] as num).toDouble();
+      }
+    }
+
+    final decoded = _simccDecode(flatX, flatY, Wx: Wx, Hy: Hy, split: 2.0);
+    final result = List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    for (int j = 0; j < decoded.length && j < 17; j++) {
+      final joint = decoded[j];
+      final px = joint[0];
+      final py = joint[1];
+      final conf = joint[2];
+      result[j][0] = crop.x + (px / crop.outW) * crop.w;
+      result[j][1] = crop.y + (py / crop.outH) * crop.h;
+      result[j][2] = conf;
+    }
+    return result;
   }
 
-  List<List<double>> _decodeHeatmap(OrtValue heat, _CropMeta meta) {
-    final n1 = heat.value as List;
-    if (n1.isEmpty) return List.generate(17, (_) => [0.0, 0.0, 0.0]);
-    final nk = n1[0] as List;
-    final K = nk.length;
-    final H = (nk[0] as List).length;
-    final W = ((nk[0] as List)[0] as List).length;
-
-    final List<List<double>> kpts =
-        List.generate(17, (_) => [0.0, 0.0, 0.0]);
-
-    for (int j = 0; j < math.min(K, 17); j++) {
-      final plane = nk[j] as List;
-      double best = -1e9;
-      int by = 0, bx = 0;
+  List<List<double>> _decodeHeatmap(OrtValue heat, _CropResult crop) {
+    final arr = heat.value as List;
+    if (arr.isEmpty) {
+      return List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    }
+    final planes = arr[0] as List;
+    final joints = math.min(17, planes.length);
+    final result = List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    for (int j = 0; j < joints; j++) {
+      final plane = planes[j] as List;
+      final H = plane.length;
+      final W = (plane[0] as List).length;
+      double bestVal = -double.infinity;
+      int bestX = 0;
+      int bestY = 0;
       for (int y = 0; y < H; y++) {
         final row = plane[y] as List;
         for (int x = 0; x < W; x++) {
           final v = (row[x] as num).toDouble();
-          if (v > best) {
-            best = v;
-            by = y;
-            bx = x;
+          if (v > bestVal) {
+            bestVal = v;
+            bestX = x;
+            bestY = y;
           }
         }
       }
-      final px = (bx + 0.5) * (meta.outW / W);
-      final py = (by + 0.5) * (meta.outH / H);
-      final x = meta.roiX + (px / meta.outW) * meta.roiW;
-      final y = meta.roiY + (py / meta.outH) * meta.roiH;
-      kpts[j][0] = x;
-      kpts[j][1] = y;
-      kpts[j][2] = 1.0;
+      final px = (bestX + 0.5) * (crop.outW / W);
+      final py = (bestY + 0.5) * (crop.outH / H);
+      result[j][0] = crop.x + (px / crop.outW) * crop.w;
+      result[j][1] = crop.y + (py / crop.outH) * crop.h;
+      result[j][2] = 1.0;
     }
-    return kpts;
+    return result;
   }
 
-  List<int> _shapeOf(dynamic v) {
-    final dims = <int>[];
-    dynamic a = v;
-    while (a is List) {
-      dims.add(a.length);
-      a = a.isNotEmpty ? a[0] : null;
+  List<List<double>> _simccDecode(
+    Float32List simccX,
+    Float32List simccY, {
+    int Wx = 384,
+    int Hy = 512,
+    double split = 2.0,
+  }) {
+    final joints = math.min(simccX.length ~/ Wx, simccY.length ~/ Hy);
+    final result = List.generate(joints, (_) => [0.0, 0.0, 0.0]);
+    for (int j = 0; j < joints; j++) {
+      final baseX = j * Wx;
+      final baseY = j * Hy;
+
+      double maxX = -double.infinity;
+      for (int i = 0; i < Wx; i++) {
+        maxX = math.max(maxX, simccX[baseX + i]);
+      }
+      double sumX = 0.0;
+      double bestProbX = 0.0;
+      int argX = 0;
+      for (int i = 0; i < Wx; i++) {
+        final expVal = math.exp(simccX[baseX + i] - maxX);
+        sumX += expVal;
+        if (expVal > bestProbX) {
+          bestProbX = expVal;
+          argX = i;
+        }
+      }
+      final probX = sumX == 0 ? 0.0 : bestProbX / sumX;
+
+      double maxY = -double.infinity;
+      for (int i = 0; i < Hy; i++) {
+        maxY = math.max(maxY, simccY[baseY + i]);
+      }
+      double sumY = 0.0;
+      double bestProbY = 0.0;
+      int argY = 0;
+      for (int i = 0; i < Hy; i++) {
+        final expVal = math.exp(simccY[baseY + i] - maxY);
+        sumY += expVal;
+        if (expVal > bestProbY) {
+          bestProbY = expVal;
+          argY = i;
+        }
+      }
+      final probY = sumY == 0 ? 0.0 : bestProbY / sumY;
+
+      final x = argX / split;
+      final y = argY / split;
+      final conf = math.sqrt(probX * probY);
+      result[j][0] = x;
+      result[j][1] = y;
+      result[j][2] = conf.isNaN ? 0.0 : conf.clamp(0.0, 1.0);
     }
-    return dims;
+    return result;
+  }
+
+  List<int> _nms(
+    List<List<double>> boxes,
+    List<double> scores,
+    double iouThr,
+    int maxDet,
+  ) {
+    final order = List<int>.generate(scores.length, (i) => i)
+      ..sort((a, b) => scores[b].compareTo(scores[a]));
+    final keep = <int>[];
+    while (order.isNotEmpty && keep.length < maxDet) {
+      final i = order.removeAt(0);
+      keep.add(i);
+      order.removeWhere((j) => _iou(boxes[i], boxes[j]) > iouThr);
+    }
+    return keep;
+  }
+
+  double _iou(List<double> a, List<double> b) {
+    final x1 = math.max(a[0], b[0]);
+    final y1 = math.max(a[1], b[1]);
+    final x2 = math.min(a[2], b[2]);
+    final y2 = math.min(a[3], b[3]);
+    final interW = math.max(0.0, x2 - x1);
+    final interH = math.max(0.0, y2 - y1);
+    final inter = interW * interH;
+    if (inter <= 0) return 0.0;
+    final areaA = (a[2] - a[0]) * (a[3] - a[1]);
+    final areaB = (b[2] - b[0]) * (b[3] - b[1]);
+    final union = areaA + areaB - inter;
+    if (union <= 0) return 0.0;
+    return inter / union;
   }
 
   List<List<double>> _remapToH36M(List<List<double>> rtm) {
@@ -847,25 +1052,24 @@ class _Det {
   final double x1, y1, x2, y2, score;
 }
 
-class _CropMeta {
-  _CropMeta({
-    required this.srcW,
-    required this.srcH,
-    required this.roiX,
-    required this.roiY,
-    required this.roiW,
-    required this.roiH,
+class _CropResult {
+  const _CropResult({
+    required this.image,
+    required this.x,
+    required this.y,
+    required this.w,
+    required this.h,
     required this.outW,
     required this.outH,
   });
-  final int srcW, srcH, outW, outH;
-  final double roiX, roiY, roiW, roiH;
-}
 
-class _CropResult {
-  _CropResult(this.image, this.meta);
   final img.Image image;
-  final _CropMeta meta;
+  final double x;
+  final double y;
+  final double w;
+  final double h;
+  final int outW;
+  final int outH;
 }
 
 class _WindowPayload {
