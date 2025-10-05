@@ -6,6 +6,13 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 
+const bool _enableVideoTranscoderLogs = false;
+
+void _videoTranscoderLog(String message) {
+  if (!_enableVideoTranscoderLogs) return;
+  debugPrint(message);
+}
+
 class VideoTranscoder {
   /// Creates a 10-fps, square-padded surrogate MP4 without touching [src].
   /// Output is centered inside 640×640, AR preserved, even dimensions enforced.
@@ -45,17 +52,17 @@ class VideoTranscoder {
       _q(outPath),
     ].join(' ');
 
-    debugPrint('[VideoTranscoder] running ffmpeg: $cmd');
+    _videoTranscoderLog('[VideoTranscoder] running ffmpeg: $cmd');
     final session = await FFmpegKit.execute(cmd);
     final rc = await session.getReturnCode();
 
     if (rc?.isValueSuccess() != true) {
       final logs = await session.getAllLogsAsString();
-      debugPrint('[VideoTranscoder] ffmpeg failed rc=$rc\n$logs');
+      _videoTranscoderLog('[VideoTranscoder] ffmpeg failed rc=$rc\n$logs');
       throw Exception('FFmpeg failed: $rc');
     }
 
-    debugPrint('[VideoTranscoder] created $outPath');
+    _videoTranscoderLog('[VideoTranscoder] created $outPath');
     return File(outPath);
   }
 

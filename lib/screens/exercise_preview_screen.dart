@@ -12,7 +12,7 @@ import 'dart:ui';
 import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
 import 'package:amplify_flutter/amplify_flutter.dart' as amp;
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show Listenable, kDebugMode;
+import 'package:flutter/foundation.dart' show Listenable, kDebugMode, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter/painting.dart' show applyBoxFit;
 import 'package:flutter/services.dart';
@@ -35,6 +35,13 @@ import '../shared/services/video_transcoder.dart'; // 10fps helper
 import '../shared/widgets/live_skeleton_overlay.dart';
 import '../shared/widgets/processing_banner.dart';
 import 'package:fit_perfect_v2/shared/services/live_pose.dart';
+
+const bool _enableExercisePreviewLogs = false;
+
+void _exercisePreviewLog(String message) {
+  if (!_enableExercisePreviewLogs) return;
+  debugPrint(message);
+}
 
 class ExercisePreviewScreen extends StatefulWidget {
   const ExercisePreviewScreen({super.key, required this.exerciseId});
@@ -194,12 +201,14 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       await _matcher.ensureLoaded();
       _refReady = _matcher.refPoints != null;
       if (kDebugMode) {
-        debugPrint('[ExercisePreview] reference loaded: $_refReady '
+        _exercisePreviewLog('[ExercisePreview] reference loaded: $_refReady '
             '(kpts=${_matcher.refPoints?.length ?? 0}, '
             'source=${_matcher.refSource ?? 'unknown'})');
       }
     } catch (e) {
-      if (kDebugMode) debugPrint('[ExercisePreview] ensureLoaded error: $e');
+      if (kDebugMode) {
+        _exercisePreviewLog('[ExercisePreview] ensureLoaded error: $e');
+      }
     }
 
     await _initCamera();
@@ -316,7 +325,9 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       };
       _cocoSink!.writeln(jsonEncode(frame));
     } catch (e) {
-      if (kDebugMode) debugPrint('appendCocoFrame failed: $e');
+      if (kDebugMode) {
+        _exercisePreviewLog('appendCocoFrame failed: $e');
+      }
     }
   }
 
@@ -381,7 +392,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       if (!mounted) return;
       if (ok != _poseOk) {
         if (kDebugMode && _logPoseEvents) {
-          debugPrint('MAE(px) = ${_lastMaePx?.toStringAsFixed(1)}; ok=$ok');
+          _exercisePreviewLog('MAE(px) = ${_lastMaePx?.toStringAsFixed(1)}; ok=$ok');
         }
         setState(() {
           _poseOk = ok;
@@ -399,7 +410,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         _updateCalibrationHold();
       }
       if (kDebugMode && _logPoseEvents) {
-        debugPrint('live 2D pose failed: $e');
+        _exercisePreviewLog('live 2D pose failed: $e');
       }
     } finally {
       _runningEst = false;
@@ -428,7 +439,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     if (kDebugMode && _logPoseEvents) {
       final refSrc = _matcher.refSource ?? 'unknown';
       final maeLabel = mae.isFinite ? mae.toStringAsFixed(2) : mae.toString();
-      debugPrint('[PoseMatch] maePx=$maeLabel, match=$ok, '
+      _exercisePreviewLog('[PoseMatch] maePx=$maeLabel, match=$ok, '
           'reference=$refSrc, liveSpace=${w}x$h (raw camera)');
     }
 
@@ -622,7 +633,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       );
     } catch (e) {
       _hideProcessingDialog();
-      debugPrint('[ExercisePreview] offline analyze failed → $e');
+      _exercisePreviewLog('[ExercisePreview] offline analyze failed → $e');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Offline analysis failed: $e')),
@@ -774,7 +785,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         subject: 'Live 2D RTM-Pose export',
       );
     } catch (e) {
-      debugPrint('Share error: $e');
+      _exercisePreviewLog('Share error: $e');
     }
   }
 
@@ -1331,12 +1342,12 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       );
 
       if (resp.statusCode == 202) {
-        debugPrint('✅ backend accepted enqueue');
+        _exercisePreviewLog('✅ backend accepted enqueue');
       } else {
-        debugPrint('⚠️ backend ${resp.statusCode}: ${resp.body}');
+        _exercisePreviewLog('⚠️ backend ${resp.statusCode}: ${resp.body}');
       }
     } catch (e) {
-      debugPrint('⚠️ could not reach backend: $e');
+      _exercisePreviewLog('⚠️ could not reach backend: $e');
     }
   }
 

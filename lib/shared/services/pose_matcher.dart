@@ -35,6 +35,13 @@ import 'dart:ui';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+const bool _enablePoseMatcherLogs = false;
+
+void _poseMatcherLog(String message) {
+  if (!_enablePoseMatcherLogs) return;
+  debugPrint(message);
+}
+
 class PoseMatcher {
   PoseMatcher({
     this.fixedMaeThresholdPx = 30.0, // absolute pixel cap
@@ -101,12 +108,12 @@ class PoseMatcher {
       _ref17 = _heuristicToCoco17(_ref17!);
       _refBBoxH = _bboxHeight(_ref17!);
       if (kDebugMode) {
-        debugPrint('[PoseMatcher] Loaded reference with ${_ref17!.length} kpts '
+        _poseMatcherLog('[PoseMatcher] Loaded reference with ${_ref17!.length} kpts '
             'from ${_refSource ?? 'unknown'} (refBBoxH=${_refBBoxH?.toStringAsFixed(1)})');
       }
     } else {
       if (kDebugMode) {
-        debugPrint('[PoseMatcher] Could not load reference from assets/meta/. '
+        _poseMatcherLog('[PoseMatcher] Could not load reference from assets/meta/. '
             'Ensure a JSON at assets/meta/reference_frame.json is listed in pubspec.');
       }
     }
@@ -276,7 +283,7 @@ class PoseMatcher {
       return null;
     } catch (e) {
       if (kDebugMode) {
-        debugPrint('[PoseMatcher] JSON load failed for "$assetPath": $e');
+        _poseMatcherLog('[PoseMatcher] JSON load failed for "$assetPath": $e');
       }
       return null;
     }

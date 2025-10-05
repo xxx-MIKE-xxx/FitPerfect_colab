@@ -24,6 +24,7 @@ import 'dart:typed_data';
 import 'dart:ui' show Offset; // for overlay points
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
@@ -110,6 +111,7 @@ class LivePoseEngine {
     }
     _jsonlPath = '${_sessionDir.path}/coco_2d.jsonl';
     _jsonlSink = File(_jsonlPath).openWrite(mode: FileMode.append);
+    debugPrint('[2D] Writing to $_jsonlPath');
 
     _debugger = debug
         ? PipelineDebugRecorder(

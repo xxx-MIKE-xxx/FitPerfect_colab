@@ -1,5 +1,6 @@
 // lib/screens/progress_screen.dart
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:go_router/go_router.dart';
@@ -14,6 +15,13 @@ import 'package:share_plus/share_plus.dart';
 /// • No extra packages required. Calendar is a custom month grid w/ heat-map.
 /// • All data is mocked; replace the *_DAO calls with your repos later.
 /// • Analytics hooks: debugPrint events for tab change, day taps, filters.
+
+const bool _enableProgressScreenLogs = false;
+
+void _progressLog(String message) {
+  if (!_enableProgressScreenLogs) return;
+  debugPrint(message);
+}
 
 class ProgressScreen extends StatefulWidget {
   const ProgressScreen({super.key});
@@ -66,7 +74,7 @@ class _ProgressScreenState extends State<ProgressScreen>
     _tab = TabController(length: 3, vsync: this);
     _tab.addListener(() {
       if (_tab.indexIsChanging) return;
-      debugPrint('analytics: progress_tab_view tab=${_tab.index}');
+      _progressLog('analytics: progress_tab_view tab=${_tab.index}');
     });
   }
 
@@ -135,7 +143,7 @@ class _ProgressScreenState extends State<ProgressScreen>
           _CalendarTab(
             sessions: _sessions,
             onDayTap: (day, sessions) {
-              debugPrint('analytics: calendar_day_tap date=$day has=${sessions.isNotEmpty}');
+              _progressLog('analytics: calendar_day_tap date=$day has=${sessions.isNotEmpty}');
               _CalendarBottomSheet.show(context, day, sessions);
             },
             onDayLongPress: _jumpHistoryTo,
@@ -837,7 +845,7 @@ class _HistoryListState extends State<_HistoryList> {
                 builder: (_) => _FilterSheet(),
               );
               if (res != null) {
-                debugPrint('analytics: history_filter_apply ${res.toJson()}');
+                _progressLog('analytics: history_filter_apply ${res.toJson()}');
                 // In real app, apply filters to repository and refresh list.
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
