@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // lib/screens/exercise_preview_screen.dart
-// Records video, lets you ANALYZE (offline on-device) and saves keypoints JSON.
-// Adds Setup & Calibration management (front cam, tilt + 2D pose gating).
+// Streams live camera frames for pose estimation, logs JSONL, and runs MotionBERT.
+// Includes setup & calibration (front cam tilt + 2D pose gating) with live overlay.
 // ─────────────────────────────────────────────────────────────────────────────
 import 'dart:async';
 import 'dart:convert';
@@ -9,31 +9,21 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
 
-import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
-import 'package:amplify_flutter/amplify_flutter.dart' as amp;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show Listenable, kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/painting.dart' show applyBoxFit;
-import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
-import 'package:http/http.dart' as http;
-import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sensors_plus/sensors_plus.dart';
-import 'package:share_plus/share_plus.dart';
-import 'package:url_launcher/url_launcher.dart';
 
-import '../shared/services/api_client.dart';
 import '../shared/services/live_pose.dart'; // LIVE RTM-Pose 2D
 import '../shared/services/pose_matcher.dart';
 import '../shared/services/pose_runtime.dart'; // offline pipeline
-import '../shared/services/pose_processing_controller.dart';
-import '../shared/services/s3_uploader.dart';
-import '../shared/services/video_transcoder.dart'; // 10fps helper
 import '../shared/widgets/live_skeleton_overlay.dart';
-import '../shared/widgets/processing_banner.dart';
+
+enum CaptureState { idle, streaming, stopping, processing3D }
 
 class ExercisePreviewScreen extends StatefulWidget {
   const ExercisePreviewScreen({super.key, required this.exerciseId});
@@ -47,9 +37,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     with TickerProviderStateMixin {
   late final CameraController _cam;
   bool _ready = false;
-  bool _recording = false;
   bool _mirrorPreview = true; // front camera previews are mirrored visually
-  final _picker = ImagePicker();
 
   // ─── Pose sanity checks toggles (0 = off, 1 = on). Turn on incrementally.
   static const int CHECK_FRAME_MARGIN = 0;
@@ -68,22 +56,22 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
 
   bool _refReady = false; // becomes true when reference JSON is loaded
   double? _lastMaePx; // for debug/toast
-  File? _lastVideo; // last recorded or picked video
-  XFile? _pendingRecording; // temp holder for safely-stopped recordings
-  late final PoseProcessingController _processingController;
-  StreamSubscription<ProgressEvent>? _processingSub;
-  ProgressEvent? _progressEvent;
-  DateTime? _recordingStartedAt;
 
-  /* ───────────── live 2D pose state ───────────── */
-  final LivePoseEngine _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
-  bool _streaming = false;
+  /* ───────────── capture/session state ───────────── */
+  late final LivePoseEngine _engine;
+  final PosePipeline _pipeline = PosePipeline();
+  CaptureState _state = CaptureState.idle;
   bool _runningEst = false; // simple reentrancy guard
   bool _poseOk = false; // true when detected 2D matches desired pose
-
-  // Live 2D export buffer (ring buffer of recent frames)
-  final List<Map<String, dynamic>> _liveKptLog = <Map<String, dynamic>>[];
-  static const int _liveKptMax = 300; // ~ last few seconds depending on FPS
+  String? _sessionId;
+  IOSink? _jsonlSink;
+  File? _jsonlFile;
+  DateTime? _captureStartedAt;
+  DateTime? _captureStoppedAt;
+  final List<Pose2DFrame> _capturedFrames = <Pose2DFrame>[];
+  int _frameStride = 3; // drop frames when busy
+  int _frameSkip = 0;
+  bool _imageStreamActive = false;
 
   /* ───────────── calibration (tilt + pose) ───────────── */
   // Live skeleton debug overlay (for on-screen QA)
@@ -120,23 +108,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   @override
   void initState() {
     super.initState();
-    _processingController = PoseProcessingController();
-    _processingSub = _processingController.progressStream.listen((event) {
-      if (!mounted) return;
-      setState(() {
-        _progressEvent = event;
-      });
-      if (event.status == ProgressStatus.complete ||
-          event.status == ProgressStatus.error ||
-          event.status == ProgressStatus.cancelled) {
-        Future.delayed(const Duration(seconds: 1), () {
-          if (!mounted) return;
-          if (_progressEvent == event) {
-            setState(() => _progressEvent = null);
-          }
-        });
-      }
-    });
+    _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
     _glowCtrl = AnimationController(
       vsync: this,
       lowerBound: 0.35,
@@ -198,8 +170,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
 
     await _initCamera();
 
-    // Start live 2D stream only after both camera and (ideally) reference are ready
-    await _setStreaming(true);
+    // Wait for explicit start to begin streaming frames
   }
 
   // ───────────── sensors/tilt ─────────────
@@ -268,42 +239,29 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     if (!_cam.value.isInitialized) return;
 
     if (enable) {
-      // Never stream while recording
-      if (_cam.value.isRecordingVideo) return;
-      if (!_cam.value.isStreamingImages) {
-        await _cam.startImageStream((CameraImage img) {
-          _onImageFromCamera(img); // fire-and-forget
-        });
-        _streaming = true;
-      }
+      if (_imageStreamActive) return;
+      await _cam.startImageStream((CameraImage img) {
+        _onImageFromCamera(img); // fire-and-forget
+      });
+      _imageStreamActive = true;
     } else {
-      if (_cam.value.isStreamingImages) {
-        try {
-          await _cam.stopImageStream();
-        } catch (_) {}
-        _streaming = false;
-        await Future.delayed(const Duration(milliseconds: 30)); // let native drain
-      }
+      if (!_imageStreamActive) return;
+      try {
+        await _cam.stopImageStream();
+      } catch (_) {}
+      _imageStreamActive = false;
+      await Future.delayed(const Duration(milliseconds: 30)); // let native drain
     }
   }
 
   Future<void> _onImageFromCamera(CameraImage img) async {
+    if (_state != CaptureState.streaming) return;
     if (_runningEst) return;
+    _frameSkip = (_frameSkip + 1) % math.max(1, _frameStride);
+    if (_frameSkip != 0) return;
     _runningEst = true;
     try {
       final pts = await _engine.estimate2D(img); // Offsets in raw camera space
-
-      // Log for export (if we have points)
-      if (pts != null) {
-        final frame = {
-          't': DateTime.now().toIso8601String(),
-          'pts': pts.map((p) => [p.dx, p.dy]).toList(growable: false),
-        };
-        _liveKptLog.add(frame);
-        if (_liveKptLog.length > _liveKptMax) {
-          _liveKptLog.removeAt(0);
-        }
-      }
 
       // Store for overlay drawing (live + reference projected to live)
       if (mounted) {
@@ -344,6 +302,10 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         });
         _updateCalibrationHold();
       }
+
+      if (pts != null) {
+        _recordPoseFrame(pts, img);
+      }
     } catch (e) {
       // On any error, be conservative
       if (mounted && _poseOk) {
@@ -359,6 +321,160 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     } finally {
       _runningEst = false;
     }
+  }
+
+  void _recordPoseFrame(List<Offset> pts, CameraImage img) {
+    if (_jsonlSink == null) return;
+    final start = _captureStartedAt;
+    final frameIndex = _capturedFrames.length;
+    final timestamp = start == null
+        ? frameIndex.toDouble()
+        : DateTime.now().difference(start).inMicroseconds / 1e6;
+    final keypoints = <PoseKeypoint2D>[];
+    for (var i = 0; i < pts.length; i++) {
+      final p = pts[i];
+      keypoints.add(PoseKeypoint2D(id: i, x: p.dx, y: p.dy, c: 1.0));
+    }
+    final frame = Pose2DFrame(
+      frameIndex: frameIndex,
+      t: timestamp,
+      imgW: img.width,
+      imgH: img.height,
+      keypoints: keypoints,
+    );
+    _capturedFrames.add(frame);
+    final line = {
+      'frameIndex': frame.frameIndex,
+      't': double.parse(frame.t.toStringAsFixed(4)),
+      'imgW': frame.imgW,
+      'imgH': frame.imgH,
+      'keypoints': keypoints
+          .map((k) => {'id': k.id, 'x': k.x, 'y': k.y, 'c': k.c ?? 0.0})
+          .toList(growable: false),
+    };
+    _jsonlSink?.writeln(jsonEncode(line));
+  }
+
+  Future<void> _onStart() async {
+    if (_state != CaptureState.idle) return;
+    if (!_cam.value.isInitialized) return;
+
+    final previousSink = _jsonlSink;
+    if (previousSink != null) {
+      await previousSink.flush();
+      await previousSink.close();
+    }
+
+    final dir = await getTemporaryDirectory();
+    final sessionId = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+    final sessionDir = Directory('${dir.path}/sessions/$sessionId');
+    await sessionDir.create(recursive: true);
+
+    _jsonlFile = File('${sessionDir.path}/coco_2d.jsonl');
+    _jsonlSink = _jsonlFile!.openWrite(mode: FileMode.writeOnlyAppend);
+    _capturedFrames.clear();
+    _frameSkip = 0;
+    _captureStartedAt = DateTime.now();
+    _captureStoppedAt = null;
+    _sessionId = sessionId;
+
+    setState(() => _state = CaptureState.streaming);
+    await _setStreaming(true);
+  }
+
+  Future<void> _onStop() async {
+    if (_state != CaptureState.streaming) return;
+    setState(() => _state = CaptureState.stopping);
+
+    await _setStreaming(false);
+    _captureStoppedAt = DateTime.now();
+
+    final sink = _jsonlSink;
+    _jsonlSink = null;
+    if (sink != null) {
+      await sink.flush();
+      await sink.close();
+    }
+
+    final file = _jsonlFile;
+    if (file == null || _capturedFrames.isEmpty) {
+      if (mounted) {
+        setState(() => _state = CaptureState.idle);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No pose frames captured. Try again.')),
+        );
+      } else {
+        _state = CaptureState.idle;
+      }
+      _jsonlFile = null;
+      _capturedFrames.clear();
+      return;
+    }
+
+    setState(() => _state = CaptureState.processing3D);
+
+    try {
+      final payload = await _runMotionBert(file.path);
+      if (!mounted) return;
+      context.go(
+        '/feedback',
+        extra: payload,
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Motion analysis failed: $e')),
+        );
+      }
+    } finally {
+      _jsonlFile = null;
+      _capturedFrames.clear();
+      if (mounted) {
+        setState(() => _state = CaptureState.idle);
+      } else {
+        _state = CaptureState.idle;
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>> _runMotionBert(String jsonlPath) async {
+    final frames = List<Pose2DFrame>.from(_capturedFrames);
+    final fps = _estimateFps();
+    final seq = Pose2DSequence(
+      frames: frames,
+      fps: fps,
+      imageWidth: frames.isEmpty ? 0 : frames.first.imgW,
+      imageHeight: frames.isEmpty ? 0 : frames.first.imgH,
+    );
+    final result3d = await _pipeline.estimate3D(seq);
+    return {
+      'sessionId': _sessionId,
+      'exerciseId': widget.exerciseId,
+      'jsonlPath': jsonlPath,
+      'pose2d': seq.frames.map((f) => f.toJson()).toList(growable: false),
+      'pose3d': result3d.sequence,
+      'windows': result3d.windows.map((w) => w.toJson()).toList(growable: false),
+      'windowSize': result3d.windowSize,
+      'stride': result3d.stride,
+      'fps': fps,
+    };
+  }
+
+  double _estimateFps() {
+    final start = _captureStartedAt;
+    final stop = _captureStoppedAt ?? DateTime.now();
+    if (start == null) {
+      return 10.0;
+    }
+    final durationMs = stop.difference(start).inMilliseconds;
+    if (durationMs <= 0) {
+      return 10.0;
+    }
+    final seconds = durationMs / 1000.0;
+    if (_capturedFrames.isEmpty) {
+      return 0.0;
+    }
+    return _capturedFrames.length / seconds;
   }
 
   // Geometric test + MAE-to-reference matching.
@@ -485,282 +601,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     return ok;
   }
 
-  /* ───────────── progress helper ───────────── */
-  Future<void> _showProcessingDialog() async {
-    await showDialog(
-      context: context,
-      barrierDismissible: false,
-      useRootNavigator: false,
-      builder: (_) => const AlertDialog(
-        content: Row(
-          children: [
-            SizedBox(
-                width: 28,
-                height: 28,
-                child: CircularProgressIndicator(strokeWidth: 3)),
-            SizedBox(width: 24),
-            Expanded(child: Text('Analyzing your video…')),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _hideProcessingDialog() {
-    if (!mounted) return;
-    Navigator.of(context, rootNavigator: false)
-        .popUntil((route) => route is! PopupRoute);
-  }
-
-  Future<File?> pickVideoFromGallery() async {
-    final xFile = await _picker.pickVideo(source: ImageSource.gallery);
-    return xFile == null ? null : File(xFile.path);
-  }
-
-  Future<File> _rememberVideo(File videoFile) async {
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final ts = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
-      final dst = File('${dir.path}/local_${widget.exerciseId}_$ts.mp4');
-      final saved = await videoFile.copy(dst.path);
-      setState(() => _lastVideo = saved);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Video ready • ${saved.path.split('/').last}')),
-        );
-      }
-      return saved;
-    } catch (_) {
-      setState(() => _lastVideo = videoFile); // fall back
-      return videoFile;
-    }
-  }
-
-  /// Write a JSON report to disk. Returns the file path.
-  Future<String> _saveLocalReport(Map<String, dynamic> report) async {
-    final dir = await getApplicationDocumentsDirectory();
-    final folder = Directory('${dir.path}/reports/${widget.exerciseId}');
-    await folder.create(recursive: true);
-    final ts = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
-    final file = File('${folder.path}/$ts.json');
-    await file
-        .writeAsString(const JsonEncoder.withIndent('  ').convert(report));
-    return file.path;
-  }
-
-  Future<void> _analyzeOffline() async {
-    final file = _lastVideo;
-    if (file == null) return;
-
-    try {
-      _showProcessingDialog();
-      final pipeline = PosePipeline();
-      final res = await pipeline.analyzeVideo(file);
-
-      final report = res.toReport(); // now contains kpts
-      final savedPath = await _saveLocalReport(report);
-      _hideProcessingDialog();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-              content:
-                  Text('✅ Saved keypoints → ${savedPath.split('/').last}')),
-        );
-      }
-
-      // Reuse your feedback flow; pass local report + local video
-      await _navigateToFeedback(
-        file.path,
-        'local/${widget.exerciseId}/${DateTime.now().millisecondsSinceEpoch}.mp4',
-        report,
-      );
-    } catch (e) {
-      _hideProcessingDialog();
-      debugPrint('[ExercisePreview] offline analyze failed → $e');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Offline analysis failed: $e')),
-      );
-    }
-  }
-
-  /* ───────────── UPLOAD & PROCESS (cloud fallback) ───────────── */
-  Future<void> _uploadAndProcess(File videoFile) async {
-    final ts = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
-    final s3Path = 'private/videos/${widget.exerciseId}/$ts.mp4';
-
-    // A. local copy (for playback)
-    String localPath = videoFile.path;
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final name = s3Path.replaceAll('/', '_');
-      final saved = await videoFile.copy('${dir.path}/$name');
-      localPath = saved.path;
-    } catch (_) {}
-
-    // B. make 10-fps surrogate for bandwidth
-    late File uploadFile;
-    try {
-      uploadFile = await VideoTranscoder.to10Fps(videoFile);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not convert to 10 fps: $e')),
-        );
-      }
-      return;
-    }
-
-    // C. upload
-    final presignedUrl = await S3Uploader.upload(uploadFile, s3Path);
-
-    // D. notify backend
-    await _notifyBackend(s3Path);
-
-    // E. poll for report
-    try {
-      _showProcessingDialog();
-      final report = await ApiClient.fetchReport(
-        s3Path,
-        delay: const Duration(seconds: 6),
-        max: 120,
-      );
-      _hideProcessingDialog();
-
-      await _navigateToFeedback(localPath, s3Path, report);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('🎉 Cloud analysis finished')),
-        );
-      }
-    } catch (e) {
-      _hideProcessingDialog();
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not fetch report – $e')),
-      );
-    }
-
-    // Optional toast with URL
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('📡 Uploaded!\n$s3Path'),
-          action: SnackBarAction(
-            label: 'Open',
-            onPressed: () => launchUrl(Uri.parse(presignedUrl)),
-          ),
-        ),
-      );
-    }
-  }
-
-  /* ───────────── NAVIGATION (→ feedback) ───────────── */
-  Future<void> _suspendCameraForRouteChange() async {
-    if (!_cam.value.isInitialized) return;
-    try {
-      if (_cam.value.isStreamingImages) {
-        await _cam.stopImageStream();
-        _streaming = false;
-        await Future.delayed(const Duration(milliseconds: 50));
-      }
-    } catch (_) {}
-    try {
-      if (_cam.value.isRecordingVideo) {
-        final x = await _cam.stopVideoRecording();
-        _pendingRecording = x;
-      }
-    } catch (_) {}
-  }
-
-  Future<void> _navigateToFeedback(
-    String videoPath,
-    String s3Path,
-    Map<String, dynamic> report,
-  ) async {
-    if (!mounted) return;
-    await _suspendCameraForRouteChange();
-    if (!mounted) return;
-    context.go(
-      '/feedback',
-      extra: {
-        'videoPath': videoPath,
-        'videoKey': s3Path,
-        'report': report,
-      },
-    );
-  }
-
-  Future<void> _exportLive2D() async {
-    if (_liveKptLog.isEmpty) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No live 2D data to export yet.')),
-      );
-      return;
-    }
-    final dir = await getApplicationDocumentsDirectory();
-    final folder = Directory('${dir.path}/live2d/${widget.exerciseId}');
-    await folder.create(recursive: true);
-    final ts = DateFormat('yyyy-MM-dd_HH-mm-ss').format(DateTime.now());
-    final file = File('${folder.path}/$ts.json');
-
-    final payload = {
-      'exerciseId': widget.exerciseId,
-      'source': 'preview_live_rtm_pose_2d',
-      'frames': _liveKptLog,
-    };
-    await file
-        .writeAsString(const JsonEncoder.withIndent('  ').convert(payload));
-
-    if (!mounted) return;
-
-    // Toast + iOS share sheet (AirDrop, Mail, etc.)
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-          content: Text('✅ Exported live 2D → ${file.path.split('/').last}')),
-    );
-
-    try {
-      await Share.shareXFiles(
-        [XFile(file.path)],
-        text: 'Live 2D RTM-Pose export (${widget.exerciseId})',
-        subject: 'Live 2D RTM-Pose export',
-      );
-    } catch (e) {
-      debugPrint('Share error: $e');
-    }
-  }
-
   /* ─────────────────── CAMERA ─────────────────── */
-  Future<void> _stopRecordingSafely() async {
-    CameraController? controller;
-    try {
-      controller = _cam;
-    } catch (_) {
-      controller = null;
-    }
-
-    final c = controller;
-    if (c == null) return;
-
-    if (c.value.isStreamingImages) {
-      try {
-        await c.stopImageStream();
-      } catch (_) {}
-      await Future.delayed(const Duration(milliseconds: 30));
-      _streaming = false;
-    }
-
-    if (c.value.isRecordingVideo) {
-      try {
-        final xFile = await c.stopVideoRecording();
-        _pendingRecording = xFile;
-      } catch (_) {}
-    }
-  }
-
   Future<void> _initCamera() async {
     final cams = await availableCameras();
     final selected = cams.firstWhere(
@@ -795,11 +636,19 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     _glowCtrl.dispose();
     _skeletonColorCtrl.dispose();
     _skeletonFadeCtrl.dispose();
-    _stopRecordingSafely();
     _logPoseEvents = false;
+    if (_imageStreamActive) {
+      try {
+        _cam.stopImageStream();
+      } catch (_) {}
+    }
+    final sink = _jsonlSink;
+    _jsonlSink = null;
+    if (sink != null) {
+      // ignore: discarded_futures
+      sink.close();
+    }
     _cam.dispose();
-    _processingSub?.cancel();
-    unawaited(_processingController.dispose());
     super.dispose();
   }
 
@@ -807,126 +656,157 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final isStreaming = _state == CaptureState.streaming;
+    final isProcessing = _state == CaptureState.processing3D;
 
-    return WillPopScope(
-      onWillPop: () async {
-        await _suspendCameraForRouteChange();
-        return true;
-      },
-      child: Scaffold(
+    return Scaffold(
+      backgroundColor: const Color(0xFFF7F9FB),
+      appBar: AppBar(
+        elevation: 0,
         backgroundColor: const Color(0xFFF7F9FB),
-        extendBodyBehindAppBar: _recording,
-        appBar: AppBar(
-          elevation: 0,
-          backgroundColor:
-              _recording ? Colors.transparent : const Color(0xFFF7F9FB),
-          foregroundColor: _recording ? Colors.white : Colors.black,
-          title: Row(
+        foregroundColor: Colors.black,
+        title: Row(
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: const BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: LinearGradient(
+                  colors: [Color(0xFFFFC107), Color(0xFFFF7043)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+              ),
+              child: Icon(_iconFor(widget.exerciseId), color: Colors.white),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              widget.exerciseId.capitalize(),
+              style: theme.textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.w800,
+                letterSpacing: -.2,
+              ),
+            ),
+          ],
+        ),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () async {
+            if (_state == CaptureState.streaming) {
+              await _setStreaming(false);
+            }
+            final sink = _jsonlSink;
+            if (sink != null) {
+              await sink.flush();
+              await sink.close();
+            }
+            _jsonlSink = null;
+            _jsonlFile = null;
+            _capturedFrames.clear();
+            _sessionId = null;
+            _captureStartedAt = null;
+            _captureStoppedAt = null;
+            if (mounted) {
+              setState(() {
+                _state = CaptureState.idle;
+              });
+              context.pop();
+            }
+          },
+        ),
+        actions: [
+          IconButton(
+            tooltip: _showLiveSkeleton ? 'Hide skeleton' : 'Show skeleton',
+            icon: Icon(_showLiveSkeleton ? Icons.visibility : Icons.visibility_off),
+            onPressed: () => setState(() => _showLiveSkeleton = !_showLiveSkeleton),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          Column(
             children: [
-              Container(
-                width: 36,
-                height: 36,
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: LinearGradient(
-                    colors: [Color(0xFFFFC107), Color(0xFFFF7043)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(28),
+                    clipBehavior: Clip.antiAlias,
+                    child: _buildCameraContent(context, fullscreen: true),
                   ),
                 ),
-                child: Icon(_iconFor(widget.exerciseId), color: Colors.white),
               ),
-              const SizedBox(width: 12),
-              Text(
-                widget.exerciseId.capitalize(),
-                style: theme.textTheme.titleLarge?.copyWith(
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: -.2,
+              SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                  child: _buildControlBar(isStreaming),
                 ),
               ),
             ],
           ),
-          leading: IconButton(
-            icon: const Icon(Icons.arrow_back),
-            onPressed: () async {
-              await _suspendCameraForRouteChange();
-              if (!mounted) return;
-              context.pop();
-            },
-          ),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.download_rounded),
-              tooltip: 'Export 2D (preview)',
-              onPressed: _exportLive2D,
+          if (isProcessing)
+            Positioned.fill(
+              child: _buildProcessingOverlay(),
             ),
-            IconButton(
-              tooltip: _showLiveSkeleton ? 'Hide skeleton' : 'Show skeleton',
-              icon:
-                  Icon(_showLiveSkeleton ? Icons.visibility : Icons.visibility_off),
-              onPressed: () =>
-                  setState(() => _showLiveSkeleton = !_showLiveSkeleton),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildControlBar(bool isStreaming) {
+    final bool canStart = _state == CaptureState.idle && _ready;
+    final bool canStop = isStreaming;
+    return Row(
+      children: [
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: canStart ? _onStart : null,
+            icon: const Icon(Icons.play_arrow_rounded),
+            label: const Text('Start capture'),
+            style: ElevatedButton.styleFrom(
+              minimumSize: const Size.fromHeight(52),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: canStop ? _onStop : null,
+            icon: const Icon(Icons.stop_rounded),
+            label: const Text('Stop'),
+            style: ElevatedButton.styleFrom(
+              minimumSize: const Size.fromHeight(52),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildProcessingOverlay() {
+    return Container(
+      color: Colors.black.withOpacity(0.6),
+      child: const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(Colors.white)),
+            SizedBox(height: 16),
+            Text(
+              'Running MotionBERT…',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ],
-        ),
-        body: _withProcessingOverlay(
-          _recording
-              ? Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    _buildCameraContent(context, fullscreen: true),
-                    SafeArea(
-                      child: Align(
-                        alignment: Alignment.bottomCenter,
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                          child: _GradientButton(
-                            height: 56,
-                            onPressed: _toggleRecording,
-                            colors: const [Color(0xFFD32F2F), Color(0xFFE53935)],
-                            icon: Icons.stop,
-                            label: 'Stop recording',
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                )
-              : Column(
-                  children: [
-                    Expanded(
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(28),
-                          clipBehavior: Clip.antiAlias,
-                          child: _buildCameraContent(context, fullscreen: false),
-                        ),
-                      ),
-                    ),
-                    SafeArea(
-                      top: false,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                        child: _ActionPanel(
-                          recording: _recording,
-                          hasVideo: _lastVideo != null,
-                          onToggleRecord: _ready ? _toggleRecording : null,
-                          onPickVideo: () async {
-                            final file = await pickVideoFromGallery();
-                            if (file == null) return;
-                            await _rememberVideo(file);
-                          },
-                          onAnalyze: _analyzeOffline,
-                          onAnalyzeCloud: () async {
-                            final f = _lastVideo;
-                            if (f != null) await _uploadAndProcess(f);
-                          },
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
         ),
       ),
     );
@@ -1089,7 +969,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
               alignment: Alignment.center,
             ),
           ),
-        const _BottomScrim(),
       ],
     );
 
@@ -1105,389 +984,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       ),
     );
   }
-
-  Future<void> _toggleRecording() async {
-    if (_recording) {
-      // Stop recording → resume live stream
-      _pendingRecording = null;
-      final endTime = DateTime.now();
-      await _stopRecordingSafely();
-      await Future.delayed(const Duration(milliseconds: 50)); // let native drain
-      setState(() => _recording = false);
-      _logPoseEvents = false;
-      final xFile = _pendingRecording;
-      _pendingRecording = null;
-      if (xFile != null) {
-        final saved = await _rememberVideo(File(xFile.path));
-        await _runPostRecordingPipeline(saved, endTime: endTime);
-      }
-      if (!_cam.value.isStreamingImages) {
-        await Future.delayed(const Duration(milliseconds: 50));
-        await _setStreaming(true);
-      }
-      HapticFeedback.selectionClick();
-      _recordingStartedAt = null;
-    } else {
-      // Start recording → stop live stream (Camera cannot do both)
-      if (_cam.value.isStreamingImages) {
-        await _setStreaming(false);
-        await Future.delayed(const Duration(milliseconds: 50)); // grace
-      }
-      await _cam.prepareForVideoRecording();
-      _pendingRecording = null;
-      await _cam.startVideoRecording();
-      setState(() => _recording = true);
-      _logPoseEvents = true;
-      _recordingStartedAt = DateTime.now();
-      HapticFeedback.heavyImpact();
-    }
-  }
-
-  Future<void> _runPostRecordingPipeline(
-    File videoFile, {
-    required DateTime endTime,
-  }) async {
-    if (_processingController.isProcessing) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Processing already in progress…')),
-        );
-      }
-      return;
-    }
-
-    final startTime = _recordingStartedAt ?? endTime;
-    final preview = _cam.value.previewSize;
-    final width = preview == null ? 0 : preview.height.toInt();
-    final height = preview == null ? 0 : preview.width.toInt();
-
-    final meta = VideoMeta(
-      sessionId: generateSessionId(),
-      fps: 10.0,
-      width: width,
-      height: height,
-      exercise: widget.exerciseId,
-      startTime: startTime,
-      endTime: endTime,
-      platform: Platform.isIOS ? 'ios' : 'android',
-      appVersion: 'dev-build',
-    );
-
-    try {
-      final outcome = await _processingController.processRecording(
-        videoFile: videoFile,
-        meta: meta,
-      );
-      final report = outcome.toFeedbackReport();
-      if (!mounted) return;
-      await _navigateToFeedback(
-        videoFile.path,
-        'local/${widget.exerciseId}/${outcome.sessionId}.mp4',
-        report,
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('🎯 3D pose analysis ready!')),
-      );
-    } on PoseProcessingCancelled {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('3D processing cancelled.')),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('3D analysis failed: $e')),
-      );
-    }
-  }
-
-  Future<void> _confirmCancelProcessing() async {
-    if (!_processingController.isProcessing) return;
-    final confirm = await showDialog<bool>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            title: const Text('Cancel processing?'),
-            content: const Text(
-                'This will discard all pose data captured for this session.'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(ctx).pop(false),
-                child: const Text('Keep processing'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.of(ctx).pop(true),
-                child: const Text('Cancel'),
-              ),
-            ],
-          ),
-        ) ??
-        false;
-    if (confirm) {
-      _processingController.cancel();
-    }
-  }
-
-  Widget _withProcessingOverlay(Widget child) {
-    final event = _progressEvent;
-    if (event == null || event.isHidden) {
-      return child;
-    }
-    final allowCancel = event.status == ProgressStatus.indeterminate ||
-        event.status == ProgressStatus.determinate;
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        child,
-        SafeArea(
-          child: Align(
-            alignment: Alignment.topCenter,
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: ProcessingBanner(
-                event: event,
-                onCancel: allowCancel ? _confirmCancelProcessing : null,
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  // POST { "s3_key": "<path>", … } to Flask /enqueue
-  Future<void> _notifyBackend(String s3Path) async {
-    const backendEndpoint = 'http://63.178.80.242:5001/enqueue';
-    try {
-      final sess = await amp.Amplify.Auth.fetchAuthSession() as CognitoAuthSession;
-      final jwt = sess.userPoolTokensResult.valueOrNull?.accessToken.raw;
-
-      final resp = await http.post(
-        Uri.parse(backendEndpoint),
-        headers: {
-          'Content-Type': 'application/json',
-          if (jwt != null) 'Authorization': 'Bearer $jwt',
-        },
-        body: jsonEncode({
-          's3_key': s3Path,
-          'exercise_id': widget.exerciseId,
-        }),
-      );
-
-      if (resp.statusCode == 202) {
-        debugPrint('✅ backend accepted enqueue');
-      } else {
-        debugPrint('⚠️ backend ${resp.statusCode}: ${resp.body}');
-      }
-    } catch (e) {
-      debugPrint('⚠️ could not reach backend: $e');
-    }
-  }
-
-  IconData _iconFor(String id) => switch (id) {
-        'squat' => Icons.fitness_center,
-        'deadlift' => Icons.accessibility_new,
-        _ => Icons.sports_gymnastics,
-      };
-}
-
-/* ───────── util ───────── */
-extension on String {
-  String capitalize() =>
-      isEmpty ? this : '${this[0].toUpperCase()}${substring(1)}';
-}
-
-/* ───────── UI widgets ───────── */
-
-class _ActionPanel extends StatelessWidget {
-  const _ActionPanel({
-    required this.recording,
-    required this.hasVideo,
-    required this.onToggleRecord,
-    required this.onPickVideo,
-    required this.onAnalyze,
-    required this.onAnalyzeCloud,
-  });
-
-  final bool recording;
-  final bool hasVideo;
-  final VoidCallback? onToggleRecord;
-  final VoidCallback onPickVideo;
-  final VoidCallback onAnalyze;
-  final VoidCallback onAnalyzeCloud;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      elevation: 10,
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(24),
-      shadowColor: Colors.black.withOpacity(.1),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _GradientButton(
-              height: 56,
-              onPressed: onToggleRecord,
-              colors: recording
-                  ? const [Color(0xFFD32F2F), Color(0xFFE53935)]
-                  : const [Color(0xFFFFC107), Color(0xFFFF7043)],
-              icon: recording ? Icons.stop : Icons.fiber_manual_record,
-              label: recording ? 'Stop recording' : 'Tap to record',
-            ),
-            const SizedBox(height: 10),
-            _GhostButton(
-              onPressed: onPickVideo,
-              icon: Icons.video_library_rounded,
-              label: 'Choose existing video',
-            ),
-            if (hasVideo) ...[
-              const SizedBox(height: 12),
-              const Divider(height: 1),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: _GradientButton(
-                      height: 52,
-                      onPressed: onAnalyze,
-                      colors: const [Color(0xFF00BFA5), Color(0xFF1DE9B6)],
-                      icon: Icons.analytics,
-                      label: 'Analyze offline',
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _GhostButton(
-                      onPressed: onAnalyzeCloud,
-                      icon: Icons.cloud_upload,
-                      label: 'Analyze in cloud',
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _GradientButton extends StatelessWidget {
-  const _GradientButton({
-    required this.onPressed,
-    required this.colors,
-    required this.icon,
-    required this.label,
-    this.height = 54,
-  });
-
-  final VoidCallback? onPressed;
-  final List<Color> colors;
-  final IconData icon;
-  final String label;
-  final double height;
-
-  @override
-  Widget build(BuildContext context) {
-    final enabled = onPressed != null;
-    return Opacity(
-      opacity: enabled ? 1 : .6,
-      child: InkWell(
-        onTap: onPressed,
-        borderRadius: BorderRadius.circular(18),
-        child: Ink(
-          height: height,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(colors: colors),
-            borderRadius: BorderRadius.circular(18),
-            boxShadow: [
-              BoxShadow(
-                color: colors.last.withOpacity(.35),
-                blurRadius: 20,
-                offset: const Offset(0, 8),
-              )
-            ],
-          ),
-          child: Center(
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(icon, color: Colors.white),
-                const SizedBox(width: 10),
-                Text(
-                  label,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w700,
-                    fontSize: 16,
-                    letterSpacing: .2,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _GhostButton extends StatelessWidget {
-  const _GhostButton({
-    required this.onPressed,
-    required this.icon,
-    required this.label,
-  });
-
-  final VoidCallback onPressed;
-  final IconData icon;
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    final border = BorderSide(color: Colors.black.withOpacity(.12));
-    return OutlinedButton.icon(
-      style: OutlinedButton.styleFrom(
-        minimumSize: const Size.fromHeight(52),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-        side: border,
-        foregroundColor: Colors.black87,
-      ),
-      onPressed: onPressed,
-      icon: Icon(icon),
-      label: Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
-    );
-  }
-}
-
-/* ───────── Visual helpers ───────── */
-
-class _BottomScrim extends StatelessWidget {
-  const _BottomScrim();
-
-  @override
-  Widget build(BuildContext context) {
-    return IgnorePointer(
-      child: Align(
-        alignment: Alignment.bottomCenter,
-        child: Container(
-          height: 120,
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment(0, .1),
-              end: Alignment.bottomCenter,
-              colors: [Colors.transparent, Color.fromARGB(140, 0, 0, 0)],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
 
 // COCO-17 skeleton connectivity (indices match your 17-point order):
 // 0:nose 1:lEye 2:rEye 3:lEar 4:rEar 5:lSh 6:rSh 7:lElb 8:rElb
