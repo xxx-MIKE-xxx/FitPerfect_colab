@@ -84,6 +84,11 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
 
   // Live 2D export buffer (ring buffer of recent frames)
   final List<Map<String, dynamic>> _liveKptLog = <Map<String, dynamic>>[];
+  // Session + 2D jsonl writer for MotionBERT stage
+  String? _liveSessionId;
+  IOSink? _cocoSink;
+  Size? _lastFrameSize; // from camera images
+
   static const int _liveKptMax = 300; // ~ last few seconds depending on FPS
 
   /* ───────────── calibration (tilt + pose) ───────────── */
@@ -288,6 +293,41 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     }
   }
 
+  
+  Future<void> _ensureLiveSession() async {
+    if (_liveSessionId != null && _cocoSink != null) return;
+    _liveSessionId = _liveSessionId ?? generateSessionId();
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/FitPerfect/${_liveSessionId}');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    final file = File('${dir.path}/coco_2d.jsonl');
+    _cocoSink?.close();
+    _cocoSink = file.openWrite(mode: FileMode.append);
+  }
+
+  Future<void> _appendCocoFrame(List<Offset> pts, int w, int h) async {
+    try {
+      await _ensureLiveSession();
+      final frame = {
+        't': DateTime.now().toUtc().toIso8601String(),
+        'img_w': w,
+        'img_h': h,
+        'kpt_coco': pts.map((p) => [p.dx, p.dy, 1.0]).toList(growable: false),
+      };
+      _cocoSink!.writeln(jsonEncode(frame));
+    } catch (e) {
+      if (kDebugMode) debugPrint('appendCocoFrame failed: $e');
+    }
+  }
+
+  Future<void> _closeCocoSink() async {
+    try {
+      await _cocoSink?.flush();
+      await _cocoSink?.close();
+    } catch (_) {}
+    _cocoSink = null;
+  }
+
   Future<void> _onImageFromCamera(CameraImage img) async {
     if (_runningEst) return;
     _runningEst = true;
@@ -311,6 +351,10 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         if (pts != null) {
           _latestPts = pts;
           _latestImgSize = Size(img.width.toDouble(), img.height.toDouble());
+
+          _lastFrameSize = _latestImgSize;
+          // Append to live coco_2d.jsonl for MotionBERT
+          await _appendCocoFrame(pts, img.width, img.height);
 
           if (_matcher.refPoints != null) {
             // Always display (and compare against) a fixed, centered reference pose.
@@ -1175,15 +1219,26 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     );
 
     try {
-      final outcome = await _processingController.processRecording(
-        videoFile: videoFile,
-        meta: meta,
+      final sessionId = _liveSessionId ?? generateSessionId();
+      final Size frameSize = _lastFrameSize ?? ( _cam.value.previewSize != null
+          ? Size(_cam.value.previewSize!.height, _cam.value.previewSize!.width)
+          : const Size(640, 480));
+      // Ensure writer flushed
+      await _closeCocoSink();
+      final out3d = await _processingController.run3DForSession(
+        sessionId,
+        frameSize,
+        rootRelative: true,
       );
-      final report = outcome.toFeedbackReport();
+      final report = {
+        'sessionId': sessionId,
+        if (out3d != null) 'out3dPath': out3d.path,
+        'frames2d_logged': _liveKptLog.length,
+      };
       if (!mounted) return;
       await _navigateToFeedback(
         videoFile.path,
-        'local/${widget.exerciseId}/${outcome.sessionId}.mp4',
+        'local/${widget.exerciseId}/$sessionId.mp4',
         report,
       );
       if (!mounted) return;

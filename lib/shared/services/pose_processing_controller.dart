@@ -5,10 +5,13 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'pose_runtime.dart';
+import 'dart:ui' show Size;
+import 'motionbert_runner.dart';
 
 typedef SessionId = String;
 
@@ -136,6 +139,9 @@ class PoseProcessingController {
   PoseProcessingController({PosePipeline? pipeline}) : _pipeline = pipeline ?? PosePipeline();
 
   final PosePipeline _pipeline;
+  // ─────────── New: MotionBERT on-device orchestrator (for live stream sessions) ───────────
+  final MotionBertRunner _mbRunner = MotionBertRunner();
+  bool _isProcessing3D = false;
   final _progressCtrl = StreamController<ProgressEvent>.broadcast();
   bool _processing = false;
   bool _cancelRequested = false;
@@ -238,6 +244,34 @@ class PoseProcessingController {
     } finally {
       _processing = false;
       _cancelRequested = false;
+    }
+  }
+
+
+  /// Runs MotionBERT 3D using the live 2D stream outputs (coco_2d.jsonl) written by LivePoseEngine.
+  /// Returns the created out_3d.json file in Documents/FitPerfect/<sessionId>/, or null on failure.
+  Future<File?> run3DForSession(
+    String sessionId,
+    Size frameSize, {
+    bool rootRelative = true,
+    bool writeNpy = false,
+  }) async {
+    if (_isProcessing3D) return null;
+    _isProcessing3D = true;
+    try {
+      final file = await _mbRunner.run(
+        sessionId: sessionId,
+        frameSize: frameSize,
+        rootRelative: rootRelative,
+        writeNpy: writeNpy,
+      );
+      return file;
+    } catch (e, st) {
+      debugPrint('[PoseProcessingController] MotionBERT failed: $e');
+      debugPrint('$st');
+      return null;
+    } finally {
+      _isProcessing3D = false;
     }
   }
 

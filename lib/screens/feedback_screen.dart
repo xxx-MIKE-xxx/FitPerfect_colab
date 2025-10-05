@@ -6,6 +6,10 @@ import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 import 'package:go_router/go_router.dart';
 
+
+import 'dart:ui' show Size;
+import 'package:path_provider/path_provider.dart';
+import 'package:fit_perfect_v2/shared/services/pose_processing_controller.dart';
 class FeedbackScreen extends StatefulWidget {
   const FeedbackScreen({
     super.key,
@@ -43,6 +47,15 @@ class _ErrorEvent {
 }
 
 class _FeedbackScreenState extends State<FeedbackScreen> {
+  // ───── 3D MotionBERT integration state ─────
+  String? _sessionId;
+  String? _out3dPath;
+  Map<String, dynamic>? _mbSummary;
+  List<String> _logTail = const [];
+  bool _loading3D = false;
+  bool _retrying3D = false;
+  String? _mbError;
+
   // ‼︎  tweak if you record with a different FPS
   static const double _assumedFps = 30.0;
 
@@ -276,6 +289,8 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
               ),
             ),
           const SizedBox(height: 4),
+          // 3D section
+          _build3DSection(context),
         ],
       ),
       // New: go to Feedback Summary
@@ -295,12 +310,183 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
             exerciseId = parts[1];
           }
 
-          context.push('/feedback-summary', extra: {
+            context.push('/feedback-summary', extra: {
             'exerciseId': exerciseId,
             's3Key'     : widget.videoKey,
             'report'    : widget.report, // lets SummaryRepository derive/fixture if server off
           });
         },
+      ),
+    );
+  }
+
+  Future<void> _loadLogTail() async {
+    final sid = _sessionId;
+    if (sid == null) return;
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('\${docs.path}/FitPerfect/\$sid');
+      final file = File('\${dir.path}/coco_2d.jsonl');
+      if (!file.existsSync()) {
+        setState(() => _logTail = const ['(no coco_2d.jsonl found yet)']);
+        return;
+      }
+      final lines = await file.readAsLines();
+      final take = lines.length >= 10 ? lines.sublist(lines.length - 10) : lines;
+      setState(() => _logTail = take);
+    } catch (e) {
+      setState(() => _logTail = ['(could not read logs: \$e)']);
+    }
+  }
+
+  Future<void> _load3D(String path) async {
+    setState(() { _loading3D = true; _mbError = null; });
+    try {
+      final f = File(path);
+      if (!await f.exists()) throw 'out_3d.json not found at \$path';
+      final obj = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+      final T = (obj['T'] as num?)?.toInt() ?? ((obj['coords_3d'] as List).length);
+      final coords = (obj['coords_3d'] as List);
+      final joints = coords.isNotEmpty ? (coords.first as List).length : 17;
+      double minZ = double.infinity, maxZ = -double.infinity;
+      for (final fr in coords) {
+        for (final j in (fr as List)) {
+          final z = (j as List)[2] as num;
+          if (z < minZ) minZ = z.toDouble();
+          if (z > maxZ) maxZ = z.toDouble();
+        }
+      }
+      setState(() {
+        _mbSummary = {
+          'frames': T,
+          'joints': joints,
+          'zMin': minZ,
+          'zMax': maxZ,
+          'path': path,
+        };
+      });
+    } catch (e) {
+      setState(() { _mbError = e.toString(); });
+    } finally {
+      if (mounted) setState(() { _loading3D = false; });
+    }
+  }
+
+  Future<void> _retry3D() async {
+    final sid = _sessionId;
+    if (sid == null) return;
+    setState(() { _retrying3D = true; _mbError = null; });
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('\${docs.path}/FitPerfect/\$sid');
+      final file = File('\${dir.path}/coco_2d.jsonl');
+      if (!file.existsSync()) throw 'coco_2d.jsonl missing in \$sid';
+      final lines = await file.readAsLines();
+      int w = 640, h = 480;
+      for (final ln in lines) {
+        if (ln.trim().isEmpty) continue;
+        final obj = jsonDecode(ln) as Map<String, dynamic>;
+        if (obj.containsKey('img_w') && obj.containsKey('img_h')) {
+          w = (obj['img_w'] as num).toInt();
+          h = (obj['img_h'] as num).toInt();
+          break;
+        }
+      }
+      final ctl = PoseProcessingController();
+      final out = await ctl.run3DForSession(sid, Size(w.toDouble(), h.toDouble()));
+      if (out != null) {
+        _out3dPath = out.path;
+        await _load3D(out.path);
+      } else {
+        throw '3D run returned null';
+      }
+    } catch (e) {
+      setState(() { _mbError = 'Retry failed: \$e'; });
+    } finally {
+      if (mounted) setState(() { _retrying3D = false; });
+    }
+  }
+
+  Widget _build3DSection(BuildContext context) {
+    final theme = Theme.of(context);
+    final has3d = _out3dPath != null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Card(
+        elevation: 1,
+        child: Padding(
+          padding: const EdgeInsets.all(12.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.auto_graph),
+                  const SizedBox(width: 8),
+                  Text('3D Analysis', style: theme.textTheme.titleMedium),
+                  const Spacer(),
+                  if (_loading3D || _retrying3D) const SizedBox(
+                    width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                ],
+              ),
+              const SizedBox(height: 8),
+              if (has3d && _mbSummary != null) ...[
+                Text('Frames: ${_mbSummary!['frames']}  ·  Joints: ${_mbSummary!['joints']}'),
+                Text(
+                  'Z range: '
+                  '${((_mbSummary!['zMin'] as num?)?.toStringAsFixed(3)) ?? '—'} .. '
+                  '${((_mbSummary!['zMax'] as num?)?.toStringAsFixed(3)) ?? '—'}',
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    FilledButton.icon(
+                      onPressed: () {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('3D viewer coming soon')),
+                        );
+                      },
+                      icon: const Icon(Icons.view_in_ar),
+                      label: const Text('Open 3D viewer'),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        '${_mbSummary!['path']}',
+                        style: theme.textTheme.bodySmall,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    )
+                  ],
+                ),
+              ] else ...[
+                if (_mbError != null) Text(_mbError!, style: TextStyle(color: theme.colorScheme.error)),
+                if (_logTail.isNotEmpty) ...[
+                  const Text('Recent 2D log (tail of coco_2d.jsonl):'),
+                  Container(
+                    constraints: const BoxConstraints(maxHeight: 140),
+                    padding: const EdgeInsets.all(8),
+                    margin: const EdgeInsets.only(top: 6),
+                    color: theme.colorScheme.surfaceVariant.withOpacity(0.4),
+                    child: SingleChildScrollView(
+                      child: Text(_logTail.join('\n'),
+                        style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    onPressed: _retrying3D ? null : _retry3D,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Retry 3D'),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }
