@@ -10,6 +10,13 @@ import 'package:flutter/foundation.dart';                       //  debugPrint
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';              //  offline copy
 
+const bool _enableApiClientLogs = false;
+
+void _apiClientLog(String message) {
+  if (!_enableApiClientLogs) return;
+  debugPrint(message);
+}
+
 /// Central place for all calls to the Flask analyzer API.
 class ApiClient {
   /// Public URL of your Flask service – change if you put it behind a proxy.
@@ -88,14 +95,14 @@ class ApiClient {
     );
 
     for (var attempt = 0; attempt < max; attempt++) {
-      debugPrint('[ApiClient] poll #${attempt + 1} → $resultUrl');
+      _apiClientLog('[ApiClient] poll #${attempt + 1} → $resultUrl');
 
       // 1  obtain a *fresh* JWT
       late final String jwt;
       try {
         jwt = await _freshJwt();
       } on AuthException catch (e) {
-        debugPrint('[ApiClient] token refresh failed → $e; retrying…');
+        _apiClientLog('[ApiClient] token refresh failed → $e; retrying…');
         await Future.delayed(const Duration(seconds: 2));
         continue;                              // next loop iteration
       }
@@ -106,7 +113,7 @@ class ApiClient {
         headers: {'Authorization': 'Bearer $jwt'},
       );
 
-      debugPrint('[ApiClient]  ↳ ${resp.statusCode}  ${resp.body}');
+      _apiClientLog('[ApiClient]  ↳ ${resp.statusCode}  ${resp.body}');
 
       /* 2.a READY ─────────────────────────────────────────────── */
       if (resp.statusCode == 200) {
@@ -115,11 +122,11 @@ class ApiClient {
           throw StateError('Missing signed URL in 200 response');
         }
 
-        debugPrint('[ApiClient] presigned URL received – downloading…');
+        _apiClientLog('[ApiClient] presigned URL received – downloading…');
 
         /* ── 3. Download the report itself ──────────────────── */
         final reportResp = await http.get(Uri.parse(signed));
-        debugPrint('[ApiClient]      download '
+        _apiClientLog('[ApiClient]      download '
             '${reportResp.statusCode}  '
             '${reportResp.contentLength ?? reportResp.bodyBytes.length} bytes');
 
@@ -133,9 +140,9 @@ class ApiClient {
             final fileName = s3Key.replaceAll('/', '_') + '.json';
             final file     = File('${dir.path}/$fileName');
             await file.writeAsString(jsonStr, flush: true);
-            debugPrint('[ApiClient] saved to ${file.path}');
+            _apiClientLog('[ApiClient] saved to ${file.path}');
           } catch (e) {
-            debugPrint('[ApiClient] could not save report locally: $e');
+            _apiClientLog('[ApiClient] could not save report locally: $e');
           }
 
           return decoded is List ? {'data': decoded} : decoded;

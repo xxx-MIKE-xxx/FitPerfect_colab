@@ -9,6 +9,17 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 enum AuthStatus { unknown, unauthenticated, awaitingCode, authenticated, error }
 
+const bool _enableAuthLogs = false;
+
+void _authLog(
+  String message, {
+  Object? error,
+  StackTrace? stackTrace,
+}) {
+  if (!_enableAuthLogs) return;
+  dev.log(message, error: error, stackTrace: stackTrace);
+}
+
 class AuthState {
   final AuthStatus status;
   final String? email;
@@ -24,7 +35,7 @@ class AuthState {
 class AuthNotifier extends StateNotifier<AuthState> {
   AuthNotifier() : super(const AuthState.unknown()) {
     _hubSub = Amplify.Hub.listen(HubChannel.Auth, (e) {
-      dev.log('Hub[Auth]: ${e.eventName}  payload=${e.payload}');
+      _authLog('Hub[Auth]: ${e.eventName}  payload=${e.payload}');
     });
     _checkLoginStatus();
   }
@@ -42,20 +53,20 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
   Future<void> _checkLoginStatus() async {
     try {
-      dev.log('Auth: fetchAuthSession…');
+      _authLog('Auth: fetchAuthSession…');
       final session = await Amplify.Auth.fetchAuthSession();
-      dev.log('Auth: isSignedIn=${session.isSignedIn}');
+      _authLog('Auth: isSignedIn=${session.isSignedIn}');
       state = session.isSignedIn ? const AuthState.authenticated()
                                  : const AuthState.unauthenticated();
     } on AuthException catch (e, st) {
-      dev.log('Auth: fetchAuthSession ERROR: ${e.message}', stackTrace: st);
+      _authLog('Auth: fetchAuthSession ERROR: ${e.message}', stackTrace: st);
       state = AuthState.error(e.message);
     }
   }
 
   Future<void> signUp({required String email, required String password}) async {
     try {
-      dev.log('Auth: signUp($email)…');
+      _authLog('Auth: signUp($email)…');
       await Amplify.Auth.signUp(
         username: email,
         password: password,
@@ -63,45 +74,45 @@ class AuthNotifier extends StateNotifier<AuthState> {
       );
       state = AuthState.awaitingCode(email);
     } on AuthException catch (e, st) {
-      dev.log('Auth: signUp ERROR: ${e.message}', stackTrace: st);
+      _authLog('Auth: signUp ERROR: ${e.message}', stackTrace: st);
       state = AuthState.error(e.message);
     }
   }
 
   Future<void> confirmCode({required String email, required String code}) async {
     try {
-      dev.log('Auth: confirmSignUp($email)…');
+      _authLog('Auth: confirmSignUp($email)…');
       final res = await Amplify.Auth.confirmSignUp(username: email, confirmationCode: code);
-      dev.log('Auth: confirmSignUp → isSignUpComplete=${res.isSignUpComplete}');
+      _authLog('Auth: confirmSignUp → isSignUpComplete=${res.isSignUpComplete}');
       if (res.isSignUpComplete) {
         await signIn(email: email, password: null);
       } else {
         state = const AuthState.unauthenticated();
       }
     } on AuthException catch (e, st) {
-      dev.log('Auth: confirmSignUp ERROR: ${e.message}', stackTrace: st);
+      _authLog('Auth: confirmSignUp ERROR: ${e.message}', stackTrace: st);
       state = AuthState.error(e.message);
     }
   }
 
   Future<void> signIn({required String email, required String? password}) async {
     try {
-      dev.log('Auth: signIn($email)…');
+      _authLog('Auth: signIn($email)…');
       await Amplify.Auth.signIn(username: email, password: password);
       await _checkLoginStatus();
     } on AuthException catch (e, st) {
-      dev.log('Auth: signIn ERROR: ${e.message}', stackTrace: st);
+      _authLog('Auth: signIn ERROR: ${e.message}', stackTrace: st);
       state = AuthState.error(e.message);
     }
   }
 
   Future<void> signOut() async {
     try {
-      dev.log('Auth: signOut(global)…');
+      _authLog('Auth: signOut(global)…');
       await Amplify.Auth.signOut(options: const SignOutOptions(globalSignOut: true));
       await _checkLoginStatus();
     } on AuthException catch (e, st) {
-      dev.log('Auth: signOut ERROR: ${e.message}', stackTrace: st);
+      _authLog('Auth: signOut ERROR: ${e.message}', stackTrace: st);
       state = AuthState.error(e.message);
     }
   }
@@ -109,11 +120,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
   /// Google / Facebook via Hosted UI
   Future<void> signInWithProvider(AuthProvider provider) async {
     if (_webUiInFlight) {
-      dev.log('HostedUI: sign-in ignored (already in flight)');
+      _authLog('HostedUI: sign-in ignored (already in flight)');
       return;
     }
     _webUiInFlight = true;
-    dev.log('HostedUI: start → $provider');
+    _authLog('HostedUI: start → $provider');
     try {
       final opts = SignInWithWebUIOptions(
         pluginOptions: const CognitoSignInWithWebUIPluginOptions(
@@ -121,12 +132,12 @@ class AuthNotifier extends StateNotifier<AuthState> {
         ),
       );
       final res = await Amplify.Auth.signInWithWebUI(provider: provider, options: opts);
-      dev.log('HostedUI: result → nextStep=${res.nextStep.signInStep} isSignedIn=${res.isSignedIn}');
+      _authLog('HostedUI: result → nextStep=${res.nextStep.signInStep} isSignedIn=${res.isSignedIn}');
       await _checkLoginStatus();
     } on AuthException catch (e, st) {
-      dev.log('HostedUI: ERROR: ${e.runtimeType}: ${e.message}', stackTrace: st);
+      _authLog('HostedUI: ERROR: ${e.runtimeType}: ${e.message}', stackTrace: st);
       if (e.message.toLowerCase().contains('cancel')) {
-        dev.log('Hint: iOS reported cancel. Check Info.plist URL scheme, '
+        _authLog('Hint: iOS reported cancel. Check Info.plist URL scheme, '
             'Cognito callback (com.fitperfect://auth), and ensure only one session is launched.');
       }
       state = AuthState.error(e.message);
@@ -139,7 +150,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
   Future<void> signInHostedUI() async {
     if (_webUiInFlight) return;
     _webUiInFlight = true;
-    dev.log('HostedUI (no provider): start');
+    _authLog('HostedUI (no provider): start');
     try {
       final opts = SignInWithWebUIOptions(
         pluginOptions: const CognitoSignInWithWebUIPluginOptions(
@@ -147,11 +158,11 @@ class AuthNotifier extends StateNotifier<AuthState> {
         ),
       );
       final res = await Amplify.Auth.signInWithWebUI(options: opts);
-      dev.log('HostedUI (no provider): result → nextStep=${res.nextStep.signInStep} '
+      _authLog('HostedUI (no provider): result → nextStep=${res.nextStep.signInStep} '
           'isSignedIn=${res.isSignedIn}');
       await _checkLoginStatus();
     } on AuthException catch (e, st) {
-      dev.log('HostedUI (no provider): ERROR: ${e.message}', stackTrace: st);
+      _authLog('HostedUI (no provider): ERROR: ${e.message}', stackTrace: st);
       state = AuthState.error(e.message);
     } finally {
       _webUiInFlight = false;
@@ -169,7 +180,7 @@ class AuthNotifier extends StateNotifier<AuthState> {
         '$domain/oauth2/authorize?identity_provider=${provider.name}'
         '&redirect_uri=${Uri.encodeComponent(redirect)}'
         '&response_type=code&client_id=$clientId&scope=$scope';
-    dev.log('HostedUI TEST URL → $url');
+    _authLog('HostedUI TEST URL → $url');
   }
 }
 

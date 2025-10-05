@@ -25,6 +25,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Size;
 
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'ort_session.dart'; // OrtManager.fromAsset(...)
@@ -74,10 +75,18 @@ class MotionBertRunner {
       'model': modelAssetPath,
     });
 
-    final file2D = File('${sessionDir.path}/coco_2d.jsonl');
+    final default2DPath = '${sessionDir.path}/coco_2d.jsonl';
+    File file2D = File(default2DPath);
     if (!await file2D.exists()) {
-      throw StateError('Missing coco_2d.jsonl at ${file2D.path}');
+      final legacy = File('${docs.path}/FitPerfect/poses/$sessionId/2d/frames.jsonl');
+      debugPrint('[3D] Trying legacy ${legacy.path}');
+      if (await legacy.exists()) {
+        file2D = legacy;
+      } else {
+        throw StateError('Missing coco_2d.jsonl at $default2DPath');
+      }
     }
+    debugPrint('[3D] Reading 2D from ${file2D.path}');
 
     try {
       // --- 1) Read COCO-17 sequence from jsonl

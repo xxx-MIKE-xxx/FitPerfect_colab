@@ -7,6 +7,13 @@ import 'package:http/http.dart' as http;
 
 import 'api_client.dart';
 
+const bool _enableSummaryRepositoryLogs = false;
+
+void _summaryRepoLog(String message) {
+  if (!_enableSummaryRepositoryLogs) return;
+  debugPrint(message);
+}
+
 class SummaryRepository {
   /// Order:
   /// 1) Try backend summary (when s3Key provided)
@@ -22,7 +29,7 @@ class SummaryRepository {
       try {
         return await ApiClient.fetchSummary(s3Key);
       } catch (e) {
-        debugPrint('[SummaryRepository] server summary failed: $e');
+        _summaryRepoLog('[SummaryRepository] server summary failed: $e');
       }
     }
 
@@ -38,7 +45,7 @@ class SummaryRepository {
             await rootBundle.loadString('assets/fixtures/summary_$exerciseId.json');
         return jsonDecode(str) as Map<String, dynamic>;
       } catch (e) {
-        debugPrint('[SummaryRepository] missing fixture for $exerciseId: $e');
+        _summaryRepoLog('[SummaryRepository] missing fixture for $exerciseId: $e');
       }
     }
 

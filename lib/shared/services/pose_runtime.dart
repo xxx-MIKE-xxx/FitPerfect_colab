@@ -11,6 +11,13 @@ import 'ort_session.dart';
 import 'tensor_utils.dart';
 import 'video_sampler.dart';
 
+const bool _enablePoseRuntimeLogs = false;
+
+void _poseRuntimeLog(String message) {
+  if (!_enablePoseRuntimeLogs) return;
+  debugPrint(message);
+}
+
 /// Callback emitted from the offline pipeline when 3D progress changes.
 typedef PosePipelineProgressCallback = void Function(PosePipelineProgress progress);
 
@@ -227,7 +234,7 @@ class PosePipeline {
         break;
       } catch (e) {
         if (kDebugMode) {
-          debugPrint('[PosePipeline] Could not load ${cfg.assetPath}: $e');
+          _poseRuntimeLog('[PosePipeline] Could not load ${cfg.assetPath}: $e');
         }
         continue;
       }
