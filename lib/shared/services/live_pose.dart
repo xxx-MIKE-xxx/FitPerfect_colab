@@ -28,12 +28,17 @@ import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
 import 'ort_session.dart';        // OrtManager.fromAsset / .run()
+import 'pipeline_debug_recorder.dart';
 import 'yuv_converter.dart';      // yuv420ToImage(CameraImage)
 
 /// Live 2D engine.
 class LivePoseEngine {
-  LivePoseEngine({int? frameStride, int? yoloEvery, this.roiMargin = 1.25})
-      : frameStride = frameStride ?? yoloEvery ?? 3;
+  LivePoseEngine({
+    int? frameStride,
+    int? yoloEvery,
+    this.roiMargin = 1.25,
+    this.debug = false,
+  }) : frameStride = frameStride ?? yoloEvery ?? 3;
 
   /// Process every Nth frame (sampling). Default 3 if not specified.
   final int frameStride;
@@ -41,10 +46,23 @@ class LivePoseEngine {
   /// Scale bbox a bit when cropping for RTM (e.g., 1.25).
   final double roiMargin;
 
+  /// Enable verbose pipeline diagnostics.
+  final bool debug;
+
+  static const List<String> _defaultProviders =
+      ['coreml', 'nnapi', 'xnnpack', 'cpu'];
+
   // ───────────── runtime state ─────────────
   bool _running = false;
   bool _busy = false;
   int _frameIndex = 0;
+
+  PipelineDebugRecorder? _debugger;
+  CameraController? _controller;
+  bool _savedFirstRgb = false;
+  bool _savedLetterbox = false;
+  bool _savedCrop = false;
+  int _lastOverlayFrame = -1;
 
   // Where 2D JSONL is written during live session.
   IOSink? _jsonlSink;
@@ -75,6 +93,12 @@ class LivePoseEngine {
     if (_running) return _sessionId;
     _running = true;
 
+    _controller = controller;
+    _savedFirstRgb = false;
+    _savedLetterbox = false;
+    _savedCrop = false;
+    _lastOverlayFrame = -1;
+
     // Resolve session folder.
     _sessionId = sessionId ?? DateTime.now().millisecondsSinceEpoch.toString();
     final Directory baseDir = writeToDocuments
@@ -87,9 +111,39 @@ class LivePoseEngine {
     _jsonlPath = '${_sessionDir.path}/coco_2d.jsonl';
     _jsonlSink = File(_jsonlPath).openWrite(mode: FileMode.append);
 
+    _debugger = debug
+        ? PipelineDebugRecorder(
+            enabled: true,
+            sessionId: _sessionId,
+            sessionDir: _sessionDir,
+          )
+        : null;
+
+    final previewSize = controller.value.previewSize;
+    _debugger?.log('SESSION_PATHS', {
+      'sessionId': _sessionId,
+      'baseDir': baseDir.path,
+      'sessionDir': _sessionDir.path,
+      'writeToDocuments': writeToDocuments,
+    });
+    _debugger?.log('CAM_CFG', {
+      'sessionId': _sessionId,
+      'lensDirection': controller.description.lensDirection.toString(),
+      'sensorOrientation': controller.description.sensorOrientation,
+      if (previewSize != null)
+        'previewSize': [previewSize.width, previewSize.height],
+    });
+    _debugger?.log('2D_SAVE_OPEN', {
+      'path': _jsonlPath,
+    });
+
     // Init ONNX sessions once (keep in current isolate for now).
     _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
     _rtm  ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
+    _debugger?.log('EP_CHAIN', {
+      'yolo': _defaultProviders,
+      'rtm': _defaultProviders,
+    });
 
     // Start image stream.
     _frameIndex = 0;
@@ -123,7 +177,14 @@ class LivePoseEngine {
     } catch (_) {}
     await _jsonlSink?.flush();
     await _jsonlSink?.close();
+    _debugger?.log('2D_SAVE_CLOSE', {
+      'path': _jsonlPath,
+      'bytes': await File(_jsonlPath).exists()
+          ? await File(_jsonlPath).length()
+          : 0,
+    });
     _jsonlSink = null;
+    await _debugger?.close();
     return _jsonlPath;
   }
 
@@ -132,6 +193,7 @@ class LivePoseEngine {
     await _overlayDataCtl.close();
     try { await _yolo?.close(); } catch (_) {}
     try { await _rtm?.close(); } catch (_) {}
+    await _debugger?.close();
   }
 
   // ───────────────────────── optional: single-frame API ─────────────────────────
@@ -172,37 +234,169 @@ class LivePoseEngine {
   // ───────────────────────── private helpers ─────────────────────────
 
   Future<void> _processFrame(CameraImage cam) async {
-    // Convert to RGB image (stride-aware, supports BGRA8888 / YUV420 variants).
+    final dbg = _debugger;
+    final int t = _frameIndex;
+
+    if (dbg != null && dbg.shouldLog('CAM', t, every: 30, first: 2)) {
+      dbg.log('CAM', {
+        't': t,
+        'resolution': [cam.width, cam.height],
+        'format': cam.format.group.toString(),
+        'planes': cam.planes.length,
+        'timestampMs': DateTime.now().millisecondsSinceEpoch,
+        if (_controller?.value.deviceOrientation != null)
+          'deviceOrientation': _controller!.value.deviceOrientation.toString(),
+      });
+    }
+
+    final yuvTimer = Stopwatch()..start();
     final rgb = yuv420ToImage(cam);
+    final double yuvMs = yuvTimer.elapsedMicroseconds / 1000.0;
+    if (dbg != null && dbg.shouldLog('YUV2RGB', t, every: 30, first: 2)) {
+      dbg.log('YUV2RGB', {
+        't': t,
+        'converter': 'yuv420ToImage',
+        'ms': double.parse(yuvMs.toStringAsFixed(3)),
+        'outputShape': [rgb.height, rgb.width, 3],
+      });
+    }
+    if (dbg != null && dbg.enabled && !_savedFirstRgb) {
+      _savedFirstRgb = true;
+      await dbg.saveImage('frame_${t.toString().padLeft(4, '0')}_rgb.jpg', rgb);
+    }
 
-    // Letterbox to 640×640 (pad=114), keep mapping params.
+    final lbTimer = Stopwatch()..start();
     final lb = _letterbox(rgb, 640, 640, pad: const [114, 114, 114]);
+    final double lbMs = lbTimer.elapsedMicroseconds / 1000.0;
+    if (dbg != null && dbg.shouldLog('LBX', t, every: 60, first: 5)) {
+      dbg.log('LBX', {
+        't': t,
+        'src': [rgb.height, rgb.width],
+        'scale': lb.r,
+        'dw': lb.dw,
+        'dh': lb.dh,
+        'fill': const [114, 114, 114],
+        'out': [lb.image.height, lb.image.width],
+        'ms': double.parse(lbMs.toStringAsFixed(3)),
+      });
+    }
+    if (dbg != null && dbg.enabled && !_savedLetterbox) {
+      _savedLetterbox = true;
+      await dbg.saveImage('t${t.toString().padLeft(4, '0')}_letterbox.jpg', lb.image);
+    }
 
-    // Prepare YOLO input [1,3,640,640], float32 RGB/255.
     final Float32List yoloIn = _toCHWFloat32(lb.image); // 3*640*640
+    if (dbg != null && dbg.shouldLog('YOLO_IN', t, every: 30, first: 5)) {
+      dbg.log('YOLO_IN', {
+        't': t,
+        'shape': [1, 3, 640, 640],
+        'normalization': 'rgb/255',
+      });
+    }
+
+    final yoloTimer = Stopwatch()..start();
     final yoloOut = await _yolo!.run({'images': yoloIn});
+    final double yoloMs = yoloTimer.elapsedMicroseconds / 1000.0;
     final Float32List pred = _asFloat32(_pickOutput(yoloOut, key: 'output0'));
+    if (dbg != null && dbg.shouldLog('YOLO_EP', t, every: 30, first: 5)) {
+      dbg.log('YOLO_EP', {
+        't': t,
+        'providers': _defaultProviders,
+        'ms': double.parse(yoloMs.toStringAsFixed(3)),
+      });
+    }
+    if (dbg != null && dbg.shouldLog('YOLO_RAW', t, every: 30, first: 5)) {
+      final List<double> firstVals = [];
+      for (int i = 0; i < math.min(3, pred.length); i++) {
+        firstVals.add(double.parse(pred[i].toStringAsFixed(4)));
+      }
+      dbg.log('YOLO_RAW', {
+        't': t,
+        'shape': [1, 84, pred.length ~/ 84],
+        'first3': firstVals,
+      });
+    }
 
-    // Decode (assumes [1,84,N] flattened → [84*N]).
     final decode = _decodeYolo(pred, lbW: 640, lbH: 640);
-
-    // Optional NMS; for single-person we pick max-score person.
     final det = _pickBestPerson(decode);
-    if (det == null) return;
+    if (dbg != null && dbg.shouldLog('YOLO_DET', t, every: 10, first: 5)) {
+      dbg.log('YOLO_DET', {
+        't': t,
+        'valid': decode.length,
+        'maxScore': det == null ? 0.0 : (det['score'] as double),
+        'bbox_lb': det == null ? null : List<double>.from(det['xyxy'] as List),
+        'norm': true,
+      });
+    }
+    if (det == null) {
+      return;
+    }
 
-    // Unletterbox → original image pixels.
-    final boxPx = _unletterbox(det['xyxy'], lb);
+    final boxPx = _unletterbox(List<double>.from(det['xyxy'] as List<double>), lb);
+    if (dbg != null && dbg.shouldLog('UNPAD', t, every: 30, first: 5)) {
+      dbg.log('UNPAD', {
+        't': t,
+        'bbox_img': boxPx,
+        'r': lb.r,
+        'dw': lb.dw,
+        'dh': lb.dh,
+      });
+    }
 
-    // Crop with ROI margin and resize to 256×192.
-    final cropRes = _cropForRtm(rgb, boxPx, outH: 256, outW: 192, margin: roiMargin);
+    final cropRes =
+        _cropForRtm(rgb, boxPx, outH: 256, outW: 192, margin: roiMargin);
+    if (dbg != null && dbg.shouldLog('CROP', t, every: 30, first: 5)) {
+      dbg.log('CROP', {
+        't': t,
+        'bbox': boxPx,
+        'rect': [cropRes.rx, cropRes.ry, cropRes.rw, cropRes.rh],
+        'scale': roiMargin,
+        'out': [256, 192],
+      });
+    }
+    if (dbg != null && dbg.enabled && !_savedCrop) {
+      _savedCrop = true;
+      await dbg.saveImage('t${t.toString().padLeft(4, '0')}_cropped.jpg', cropRes.image);
+    }
 
-    // RTMPose input [1,3,256,192], rgb_255
     final Float32List rtmIn = _toCHWFloat32(cropRes.image);
-    final rtmOut = await _rtm!.run({'input': rtmIn});
-    final Float32List simccX = _asFloat32(_pickOutput(rtmOut, key: 'simcc_x', index: 0));
-    final Float32List simccY = _asFloat32(_pickOutput(rtmOut, key: 'simcc_y', index: 1));
+    if (dbg != null && dbg.shouldLog('RTM_IN', t, every: 30, first: 5)) {
+      dbg.log('RTM_IN', {
+        't': t,
+        'shape': [1, 3, 256, 192],
+        'normalization': 'rgb/255',
+      });
+    }
 
-    final kptsIn = _simccDecode(simccX, simccY, 17, 384, 512, splitRatio: 2.0);
+    final rtmTimer = Stopwatch()..start();
+    final rtmOut = await _rtm!.run({'input': rtmIn});
+    final double rtmMs = rtmTimer.elapsedMicroseconds / 1000.0;
+    final Float32List simccX =
+        _asFloat32(_pickOutput(rtmOut, key: 'simcc_x', index: 0));
+    final Float32List simccY =
+        _asFloat32(_pickOutput(rtmOut, key: 'simcc_y', index: 1));
+    if (dbg != null && dbg.shouldLog('RTM_EP', t, every: 30, first: 5)) {
+      dbg.log('RTM_EP', {
+        't': t,
+        'providers': _defaultProviders,
+        'ms': double.parse(rtmMs.toStringAsFixed(3)),
+      });
+    }
+
+    final kptsIn =
+        _simccDecode(simccX, simccY, 17, 384, 512, splitRatio: 2.0);
+
+    if (dbg != null && dbg.shouldLog('RTM_OUT', t, every: 30, first: 5)) {
+      final confidences = kptsIn
+          .map((kp) => kp.length > 2 ? kp[2] : 0.0)
+          .toList(growable: false);
+      confidences.sort((a, b) => b.compareTo(a));
+      dbg.log('RTM_OUT', {
+        't': t,
+        'simcc': {'x': [1, 17, 384], 'y': [1, 17, 512]},
+        'topConf': confidences.take(3).toList(),
+      });
+    }
 
     // Build overlay points and data.
     final pts = <Offset>[];
@@ -213,6 +407,40 @@ class LivePoseEngine {
       final c = kp[2];
       pts.add(Offset(x, y));
       kptsPx.add([x, y, c]);
+    }
+
+    if (dbg != null && dbg.shouldLog('KPTS_IMG', t, every: 10, first: 5)) {
+      double minX = double.infinity,
+          maxX = -double.infinity,
+          minY = double.infinity,
+          maxY = -double.infinity,
+          confSum = 0.0;
+      for (final kp in kptsPx) {
+        minX = math.min(minX, kp[0]);
+        maxX = math.max(maxX, kp[0]);
+        minY = math.min(minY, kp[1]);
+        maxY = math.max(maxY, kp[1]);
+        confSum += kp[2];
+      }
+      final confMean = kptsPx.isEmpty ? 0.0 : confSum / kptsPx.length;
+      dbg.log('KPTS_IMG', {
+        't': t,
+        'conf_mean': double.parse(confMean.toStringAsFixed(4)),
+        'x_ptp': maxX - minX,
+        'y_ptp': maxY - minY,
+      });
+    }
+
+    if (dbg != null && dbg.shouldLog('OVERLAY', t, every: 60, first: 2) &&
+        t != _lastOverlayFrame) {
+      final overlay = _drawOverlay(rgb, boxPx, kptsPx);
+      await dbg.saveImage('overlay_t${t.toString().padLeft(4, '0')}.jpg', overlay);
+      dbg.log('OVERLAY', {
+        't': t,
+        'path':
+            '${_sessionDir.path}/overlay_t${t.toString().padLeft(4, '0')}.jpg',
+      });
+      _lastOverlayFrame = t;
     }
 
     // Publish overlays (points first for UI, raw data optional).
@@ -235,6 +463,13 @@ class LivePoseEngine {
       'lb': {'r': lb.r, 'dw': lb.dw, 'dh': lb.dh},
     });
     _jsonlSink?.writeln(line);
+    if (dbg != null && dbg.shouldLog('2D_SAVE_WRITE', t, every: 30, first: 5)) {
+      dbg.log('2D_SAVE_WRITE', {
+        't': t,
+        'path': _jsonlPath,
+        'bytes': line.length,
+      });
+    }
   }
 
   // Convert img.Image (RGB888) to CHW float32 [0..1].
@@ -340,6 +575,31 @@ class LivePoseEngine {
     final resized = img.copyResize(crop, width: outW, height: outH, interpolation: img.Interpolation.linear);
     return _CropResult(resized, rx, ry, rw, rh);
   }
+
+  img.Image _drawOverlay(img.Image base, List<double> bbox, List<List<double>> kpts) {
+    final overlay = img.copyResize(base,
+      width: base.width,
+      height: base.height,
+      interpolation: img.Interpolation.nearest);
+    img.drawRect(
+    overlay,
+      x1: bbox[0].round(),
+      y1: bbox[1].round(),
+      x2: bbox[2].round(),
+      y2: bbox[3].round(),
+      color: img.ColorRgb8(0, 255, 0),
+    );
+    for (final kp in kpts) {
+      img.drawCircle(
+        overlay,
+        x: kp[0].round(),
+        y: kp[1].round(),
+        radius: 3,
+        color: img.ColorRgb8(255, 0, 0),
+      );
+    }
+    return overlay;
+}
 
   /// Minimal SimCC decoder: argmax on each joint's x/y logits.
   /// simccX: [1,J,W], simccY: [1,J,H]; coords returned in input-space (W->192, H->256) via splitRatio.

@@ -78,7 +78,7 @@ flutter:
     - assets/models/motionbert_lite_81.onnx
     - assets/meta/coco17_neutral_skeleton.json
     - assets/models/motionbert_3d_243.onnx
-    - assets/config/motionbert.cfg
+    - assets/models/dev/motionbert.cfg
     # Uncomment as you add real assets
     # - assets/icons/
     # - assets/images/
