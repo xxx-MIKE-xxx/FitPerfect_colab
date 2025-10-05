@@ -58,7 +58,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   double? _lastMaePx; // for debug/toast
 
   /* ───────────── capture/session state ───────────── */
-  late final LivePoseEngine _engine;
+  late final LivePosePreviewEngine _engine;
   final PosePipeline _pipeline = PosePipeline();
   CaptureState _state = CaptureState.idle;
   bool _runningEst = false; // simple reentrancy guard
@@ -108,7 +108,10 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   @override
   void initState() {
     super.initState();
-    _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
+    _engine = LivePosePreviewEngine(
+      roiMargin: 1.25,
+      confidenceThreshold: 0.15,
+    );
     _glowCtrl = AnimationController(
       vsync: this,
       lowerBound: 0.35,
@@ -169,6 +172,19 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     }
 
     await _initCamera();
+
+    try {
+      await _engine.ensureInitialized();
+    } catch (e, stack) {
+      if (kDebugMode) {
+        debugPrint('[ExercisePreview] engine init error: $e\n$stack');
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Pose engine failed to initialize: $e')),
+        );
+      }
+    }
 
     // Wait for explicit start to begin streaming frames
   }
@@ -261,7 +277,12 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     if (_frameSkip != 0) return;
     _runningEst = true;
     try {
-      final pts = await _engine.estimate2D(img); // Offsets in raw camera space
+      final frame = await _engine.processFrame(img);
+      final pts = frame == null
+          ? null
+          : frame.kptsCoco
+              .map((p) => Offset(p[0].toDouble(), p[1].toDouble()))
+              .toList(growable: false);
 
       // Store for overlay drawing (live + reference projected to live)
       if (mounted) {
@@ -303,8 +324,8 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         _updateCalibrationHold();
       }
 
-      if (pts != null) {
-        _recordPoseFrame(pts, img);
+      if (frame != null) {
+        _recordPoseFrame(frame, img);
       }
     } catch (e) {
       // On any error, be conservative
@@ -323,7 +344,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     }
   }
 
-  void _recordPoseFrame(List<Offset> pts, CameraImage img) {
+  void _recordPoseFrame(LivePoseFrame frame, CameraImage img) {
     if (_jsonlSink == null) return;
     final start = _captureStartedAt;
     final frameIndex = _capturedFrames.length;
@@ -331,23 +352,33 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         ? frameIndex.toDouble()
         : DateTime.now().difference(start).inMicroseconds / 1e6;
     final keypoints = <PoseKeypoint2D>[];
-    for (var i = 0; i < pts.length; i++) {
-      final p = pts[i];
-      keypoints.add(PoseKeypoint2D(id: i, x: p.dx, y: p.dy, c: 1.0));
+    final coco = frame.kptsCoco;
+    for (var i = 0; i < coco.length; i++) {
+      final p = coco[i];
+      keypoints.add(
+        PoseKeypoint2D(
+          id: i,
+          x: p[0],
+          y: p[1],
+          c: p.length > 2 ? p[2] : 0.0,
+        ),
+      );
     }
-    final frame = Pose2DFrame(
+    final poseFrame = Pose2DFrame(
       frameIndex: frameIndex,
       t: timestamp,
       imgW: img.width,
       imgH: img.height,
       keypoints: keypoints,
     );
-    _capturedFrames.add(frame);
+    _capturedFrames.add(poseFrame);
     final line = {
-      'frameIndex': frame.frameIndex,
-      't': double.parse(frame.t.toStringAsFixed(4)),
-      'imgW': frame.imgW,
-      'imgH': frame.imgH,
+      'frameIndex': poseFrame.frameIndex,
+      't': double.parse(poseFrame.t.toStringAsFixed(4)),
+      'imgW': poseFrame.imgW,
+      'imgH': poseFrame.imgH,
+      'confidence': frame.confMean,
+      'bbox': frame.bbox,
       'keypoints': keypoints
           .map((k) => {'id': k.id, 'x': k.x, 'y': k.y, 'c': k.c ?? 0.0})
           .toList(growable: false),
@@ -648,6 +679,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       // ignore: discarded_futures
       sink.close();
     }
+    _engine.dispose();
     _cam.dispose();
     super.dispose();
   }

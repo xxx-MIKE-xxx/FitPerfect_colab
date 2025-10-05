@@ -65,6 +65,40 @@ class LivePoseOptions {
     this.simccY = 512,
     this.cropScale = 1.25,
   });
+
+  LivePoseOptions copyWith({
+    int? yoloInput,
+    List<int>? padColor,
+    double? personConf,
+    double? personIou,
+    int? personClassId,
+    String? yoloUnits,
+    String? yoloCoords,
+    int? rtmH,
+    int? rtmW,
+    String? rtmPreproc,
+    double? simccRatio,
+    int? simccX,
+    int? simccY,
+    double? cropScale,
+  }) {
+    return LivePoseOptions(
+      yoloInput: yoloInput ?? this.yoloInput,
+      padColor: padColor ?? this.padColor,
+      personConf: personConf ?? this.personConf,
+      personIou: personIou ?? this.personIou,
+      personClassId: personClassId ?? this.personClassId,
+      yoloUnits: yoloUnits ?? this.yoloUnits,
+      yoloCoords: yoloCoords ?? this.yoloCoords,
+      rtmH: rtmH ?? this.rtmH,
+      rtmW: rtmW ?? this.rtmW,
+      rtmPreproc: rtmPreproc ?? this.rtmPreproc,
+      simccRatio: simccRatio ?? this.simccRatio,
+      simccX: simccX ?? this.simccX,
+      simccY: simccY ?? this.simccY,
+      cropScale: cropScale ?? this.cropScale,
+    );
+  }
 }
 
 /// Overlay data for the preview layer.
@@ -330,7 +364,7 @@ class LivePoseEngine {
     Future.microtask(() async {
       try {
         final rgbImage = yuv420ToImage(image);
-        final rgbBytes = _imageToRgbBytes(rgbImage);
+        final rgbBytes = imageToRgbBytes(rgbImage);
         final payload = <String, Object?>{
           'type': 'frame',
           'frameIndex': currentIndex,
@@ -377,19 +411,180 @@ class LivePoseEngine {
     }
   }
 
-  static Uint8List _imageToRgbBytes(img.Image image) {
-    final out = Uint8List(image.width * image.height * 3);
-    int offset = 0;
-    for (int y = 0; y < image.height; y++) {
-      for (int x = 0; x < image.width; x++) {
-        final pixel = image.getPixel(x, y);
-        out[offset++] = img.getRed(pixel);
-        out[offset++] = img.getGreen(pixel);
-        out[offset++] = img.getBlue(pixel);
-      }
+}
+
+/// Lightweight helper used by the exercise preview screen to synchronously
+/// process individual camera frames on the UI isolate. It reuses the same
+/// ONNX models as the full [LivePoseEngine] but exposes a much simpler API
+/// focused on `processFrame` → `LivePoseFrame` results.
+class LivePosePreviewEngine {
+  LivePosePreviewEngine({
+    this.yoloFrameInterval = 1,
+    double roiMargin = 1.25,
+    LivePoseOptions? options,
+    LivePoseModelConfig? modelConfig,
+    this.confidenceThreshold = 0.1,
+    bool? assumeNv21,
+  })  : _options = (options ?? const LivePoseOptions())
+            .copyWith(cropScale: roiMargin),
+        _modelConfig = modelConfig ??
+            const LivePoseModelConfig(
+              yoloAssetPath: 'assets/models/yolov8n.onnx',
+              rtmAssetPath: 'assets/models/rtmpose-m_256x192.onnx',
+            ),
+        _assumeNv21 = assumeNv21;
+
+  final int yoloFrameInterval;
+  final LivePoseOptions _options;
+  final LivePoseModelConfig _modelConfig;
+  final bool? _assumeNv21;
+  final double confidenceThreshold;
+
+  LivePose? _live;
+  OrtSession? _yoloSession;
+  OrtSession? _rtmSession;
+  Future<void>? _initFuture;
+  double? _lastConfidence;
+
+  double? get lastConfidence => _lastConfidence;
+
+  Future<void> ensureInitialized() async {
+    if (_live != null) return;
+    _initFuture ??= _load();
+    try {
+      await _initFuture;
+    } catch (error) {
+      _initFuture = null;
+      rethrow;
     }
-    return out;
   }
+
+  Future<LivePoseFrame?> processFrame(CameraImage image) async {
+    await ensureInitialized();
+    final live = _live;
+    if (live == null) return null;
+
+    final rgbImage = yuv420ToImage(image, assumeNV21: _assumeNv21);
+    final rgbBytes = imageToRgbBytes(rgbImage);
+    final frame = await live.processFrameRgb(
+      rgbBytes,
+      rgbImage.width,
+      rgbImage.height,
+    );
+    _lastConfidence = frame.confMean;
+    if (frame.confMean < confidenceThreshold) {
+      return null;
+    }
+    return frame;
+  }
+
+  void dispose() {
+    try {
+      _yoloSession?.release();
+    } catch (_) {}
+    try {
+      _rtmSession?.release();
+    } catch (_) {}
+    _yoloSession = null;
+    _rtmSession = null;
+    _live = null;
+    _initFuture = null;
+    _lastConfidence = null;
+  }
+
+  Future<void> _load() async {
+    final yoloSession = await OrtManager.fromAssetWithProviders(
+      _modelConfig.yoloAssetPath,
+      providers: _modelConfig.yoloProviders,
+    );
+    final rtmSession = await OrtManager.fromAssetWithProviders(
+      _modelConfig.rtmAssetPath,
+      providers: _modelConfig.rtmProviders,
+    );
+
+    try {
+      _yoloSession = yoloSession;
+      _rtmSession = rtmSession;
+      _live = await LivePose.create(
+        options: _options,
+        yoloRun: _runYolo,
+        rtmRun: _runRtm,
+      );
+    } catch (error) {
+      try {
+        yoloSession.release();
+      } catch (_) {}
+      try {
+        rtmSession.release();
+      } catch (_) {}
+      rethrow;
+    }
+  }
+
+  Future<Float32List> _runYolo(Float32List chwInput) async {
+    final session = _yoloSession;
+    if (session == null) return Float32List(0);
+    final input = OrtValueTensor.createTensorWithDataList(
+      chwInput,
+      [1, 3, _options.yoloInput, _options.yoloInput],
+    );
+    final runOptions = OrtRunOptions();
+    final outputs = await session.runAsync(runOptions, {'images': input});
+    runOptions.release();
+    input.release();
+    if (outputs == null || outputs.isEmpty) {
+      return Float32List(0);
+    }
+    final first = outputs.first!;
+    final flattened = _ortValueToFloat32List(first);
+    for (final value in outputs) {
+      value?.release();
+    }
+    return flattened;
+  }
+
+  Future<Map<String, Float32List>> _runRtm(Float32List chwInput) async {
+    final session = _rtmSession;
+    if (session == null) return <String, Float32List>{};
+    final input = OrtValueTensor.createTensorWithDataList(
+      chwInput,
+      [1, 3, _options.rtmH, _options.rtmW],
+    );
+    final runOptions = OrtRunOptions();
+    final outputs = await session.runAsync(runOptions, {'input': input});
+    runOptions.release();
+    input.release();
+    final result = <String, Float32List>{};
+    if (outputs != null) {
+      final names = session.outputNames;
+      for (int i = 0; i < outputs.length; i++) {
+        final value = outputs[i];
+        if (value == null) continue;
+        final name = (names.length > i) ? names[i] : 'output_$i';
+        result[name] = _ortValueToFloat32List(value);
+      }
+      for (final value in outputs) {
+        value?.release();
+      }
+      result['simcc_x'] ??= result['output_0'] ?? result['0'] ?? Float32List(0);
+      result['simcc_y'] ??= result['output_1'] ?? result['1'] ?? Float32List(0);
+    }
+    return result;
+  }
+}
+
+Uint8List imageToRgbBytes(img.Image image) {
+  final out = Uint8List(image.width * image.height * 3);
+  int offset = 0;
+  for (int y = 0; y < image.height; y++) {
+    for (int x = 0; x < image.width; x++) {
+      final pixel = image.getPixel(x, y);
+      out[offset++] = img.getRed(pixel);
+      out[offset++] = img.getGreen(pixel);
+      out[offset++] = img.getBlue(pixel);
+    }
+  }
+  return out;
 }
 
 /// YOLO inference callback signature.
