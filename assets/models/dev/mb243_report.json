@@ -1,0 +1,40 @@
+{
+  "model_path": "/Users/john/FitPerfect_Mobile/assets/models/motionbert_3d_243.onnx",
+  "input_output": {
+    "inputs": [
+      {
+        "name": "input",
+        "shape": [
+          1,
+          243,
+          17,
+          3
+        ],
+        "dtype": "tensor(float)"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "output",
+        "shape": [
+          1,
+          243,
+          17,
+          3
+        ],
+        "dtype": "tensor(float)"
+      }
+    ]
+  },
+  "clip_length": 243,
+  "used_channels": 3,
+  "rootrel": {
+    "is_root_relative": false,
+    "stats": {
+      "pelvis_mean_norm": 0.0026697989087551832,
+      "pelvis_max_norm": 0.010030158795416355,
+      "pelvis_std_norm": 0.0012171051930636168,
+      "frames": 243
+    }
+  }
+}

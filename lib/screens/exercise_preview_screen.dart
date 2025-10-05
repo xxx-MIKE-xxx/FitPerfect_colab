@@ -1489,6 +1489,29 @@ class _BottomScrim extends StatelessWidget {
   }
 }
 
+// COCO-17 skeleton connectivity (indices match your 17-point order):
+// 0:nose 1:lEye 2:rEye 3:lEar 4:rEar 5:lSh 6:rSh 7:lElb 8:rElb
+// 9:lWrist 10:rWrist 11:lHip 12:rHip 13:lKnee 14:rKnee 15:lAnk 16:rAnk
+const List<List<int>> _edges = <List<int>>[
+  [5, 6],   // shoulders
+  [5, 7],   // left upper arm
+  [7, 9],   // left forearm
+  [6, 8],   // right upper arm
+  [8, 10],  // right forearm
+  [11, 12], // hips
+  [5, 11],  // left torso
+  [6, 12],  // right torso
+  [11, 13], // left thigh
+  [13, 15], // left shin
+  [12, 14], // right thigh
+  [14, 16], // right shin
+  [0, 5],   // nose to left shoulder (optional head/neck link)
+  [0, 6],   // nose to right shoulder
+  // (You can add eye/ear links if you want the head triangle,
+  // e.g., [1,0], [2,0], [1,3], [2,4])
+];
+
+
 /// Painter that reuses the reference skeleton coordinates and renders them as
 /// a glowing outline. This keeps the silhouette perfectly aligned with the
 /// reference pose that powers the matcher.

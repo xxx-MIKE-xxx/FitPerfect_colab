@@ -1,0 +1,132 @@
+{
+  "yolov8": {
+    "path": "/Users/john/FitPerfect_Mobile/assets/models/yolov8n.onnx",
+    "framework": "YOLOv8 (detection)",
+    "ort_io": {
+      "inputs": [
+        {
+          "name": "images",
+          "dtype": "tensor(float)",
+          "shape": [
+            1,
+            3,
+            640,
+            640
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output0",
+          "dtype": "tensor(float)",
+          "shape": [
+            1,
+            84,
+            8400
+          ]
+        }
+      ]
+    },
+    "input_nchw": [
+      1,
+      3,
+      640,
+      640
+    ],
+    "output_shapes": [
+      [
+        1,
+        84,
+        8400
+      ]
+    ],
+    "raw_head_layout": "[B, 84/85, N]",
+    "num_classes_inferred": 80,
+    "num_candidates_inferred": 8400,
+    "nms_in_graph": false
+  },
+  "rtmpose": {
+    "path": "/Users/john/FitPerfect_Mobile/assets/models/rtmpose-m_256x192.onnx",
+    "framework": "RTMPose (top-down 2D pose)",
+    "ort_io": {
+      "inputs": [
+        {
+          "name": "input",
+          "dtype": "tensor(float)",
+          "shape": [
+            null,
+            3,
+            256,
+            192
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "simcc_x",
+          "dtype": "tensor(float)",
+          "shape": [
+            null,
+            null,
+            384
+          ]
+        },
+        {
+          "name": "simcc_y",
+          "dtype": "tensor(float)",
+          "shape": [
+            null,
+            null,
+            512
+          ]
+        }
+      ]
+    },
+    "input_nchw": [
+      1,
+      3,
+      256,
+      192
+    ],
+    "output_shapes": [
+      [
+        1,
+        17,
+        384
+      ],
+      [
+        1,
+        17,
+        512
+      ]
+    ],
+    "head_type": "SimCC",
+    "num_keypoints_inferred": 17,
+    "simcc_split_ratio": [
+      2.0,
+      2.0
+    ]
+  },
+  "notes": {
+    "motionbert_input": "[B, T, 17, C] with H36M-17 joints; convert from COCO-17 before feeding",
+    "h36m_order": [
+      "Pelvis",
+      "RHip",
+      "RKnee",
+      "RAnkle",
+      "LHip",
+      "LKnee",
+      "LAnkle",
+      "Spine1",
+      "Neck",
+      "Head",
+      "Site",
+      "LShoulder",
+      "LElbow",
+      "LWrist",
+      "RShoulder",
+      "RElbow",
+      "RWrist"
+    ]
+  }
+}
