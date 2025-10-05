@@ -1,31 +1,28 @@
-
-// Copyright
-// Live per-frame 2D pipeline for Flutter using ONNX models (YOLOv8 + RTMPose).
-// - Letterbox to 640x640 (pad=114) → YOLO → unletterbox → crop→256x192 → RTMPose (SimCC) → map back to image
-// - Saves per-frame 2D results to a JSONL file in the temporary directory
-// - No autodetection: parameters are explicit via LivePoseOptions
+// Live camera pose engine for streaming YOLO → RTMPose on a background isolate.
 //
-// This file avoids hard dependencies on your OrtSession type. Instead, you pass
-// two inference callbacks: one for YOLO and one for RTMPose, so existing code stays intact.
-//
-// Usage sketch (pseudocode):
-//   final live = await LivePose.create(options: LivePoseOptions());
-//   await live.startRecording();
-//   // per frame (RGB bytes, w, h):
-//   final frame = await live.processFrameRgb(rgbBytes, width, height);
-//   // draw frame.kptsCoco and frame.bbox
-//   final pathJsonl = await live.stopRecording(); // path to coco_2d.jsonl
-//
-// NOTE: For production throughput, prefer native YUV->RGB conversion and resizing.
-// This pure-Dart version is correct but not optimized for 30–60 fps workloads.
+// This implementation follows the "Option B" design where we operate directly on
+// the live camera stream (no intermediate video recording). Frames are sampled
+// according to a configurable stride, processed on a worker isolate, and the
+// overlay/UI is updated via a throttled broadcast stream. Each processed frame
+// produces a JSONL line which is written to disk; when capture stops, the JSONL
+// is finalized and the MotionBERT stage can be invoked immediately.
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
+import 'package:image/image.dart' as img;
+import 'package:onnxruntime/onnxruntime.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+
+import 'ort_session.dart';
+import 'yuv_converter.dart';
 
 /// Options strictly mirroring the Python pipeline.
 class LivePoseOptions {
@@ -54,7 +51,7 @@ class LivePoseOptions {
 
   const LivePoseOptions({
     this.yoloInput = 640,
-    this.padColor = const [114,114,114],
+    this.padColor = const [114, 114, 114],
     this.personConf = 0.25,
     this.personIou = 0.45,
     this.personClassId = 0,
@@ -70,13 +67,338 @@ class LivePoseOptions {
   });
 }
 
+/// Overlay data for the preview layer.
+class OverlayData {
+  final int frameIndex;
+  final List<double> bbox;
+  final List<List<double>> keypoints;
+  final double confidence;
+  final int timestampUs;
+
+  const OverlayData({
+    required this.frameIndex,
+    required this.bbox,
+    required this.keypoints,
+    required this.confidence,
+    required this.timestampUs,
+  });
+}
+
+/// Callback invoked after the JSONL is finalized so the caller can trigger
+/// MotionBERT or any downstream processing. Returning a Future allows callers to
+/// chain additional async work.
+typedef MotionBertCallback = Future<void> Function(
+  String sessionId,
+  String sessionDirectory,
+  String jsonlPath,
+);
+
+/// Configuration for the ONNX Runtime models the worker should load.
+class LivePoseModelConfig {
+  final String yoloAssetPath;
+  final String rtmAssetPath;
+  final List<String> yoloProviders;
+  final List<String> rtmProviders;
+
+  const LivePoseModelConfig({
+    required this.yoloAssetPath,
+    required this.rtmAssetPath,
+    this.yoloProviders = const ['coreml', 'nnapi', 'xnnpack', 'cpu'],
+    this.rtmProviders = const ['coreml', 'nnapi', 'xnnpack', 'cpu'],
+  });
+}
+
+/// High level controller that manages the camera stream, a worker isolate for
+/// inference, and JSONL output.
+class LivePoseEngine {
+  LivePoseEngine({
+    required CameraController cameraController,
+    required LivePoseOptions options,
+    required LivePoseModelConfig modelConfig,
+    MotionBertCallback? onMotionBert,
+  })  : _cameraController = cameraController,
+        _options = options,
+        _modelConfig = modelConfig,
+        _motionBertCallback = onMotionBert;
+
+  final CameraController _cameraController;
+  final LivePoseOptions _options;
+  final LivePoseModelConfig _modelConfig;
+  final MotionBertCallback? _motionBertCallback;
+
+  final StreamController<OverlayData> _overlayController =
+      StreamController<OverlayData>.broadcast();
+
+  Stream<OverlayData> get overlayStream => _overlayController.stream;
+
+  IOSink? _jsonlSink;
+  String? _jsonlPath;
+  Directory? _sessionDir;
+  String? _sessionId;
+
+  bool _isStreaming = false;
+  bool _processingFrame = false;
+  int _frameStride = 3;
+  int _frameCounter = 0;
+  Duration _overlayInterval = const Duration(milliseconds: 66);
+  DateTime _lastOverlayEmit = DateTime.fromMillisecondsSinceEpoch(0);
+  void Function(Object error)? _onError;
+
+  ReceivePort? _workerPort;
+  ReceivePort? _workerErrorPort;
+  ReceivePort? _workerExitPort;
+  StreamSubscription? _workerSubscription;
+  StreamSubscription? _workerErrorSubscription;
+  SendPort? _workerSendPort;
+  Completer<void>? _workerExitCompleter;
+
+  /// Starts the camera image stream and worker isolate. Returns the session ID
+  /// (directory name).
+  Future<String> start({
+    int frameStride = 3,
+    int overlayFps = 15,
+    bool writeToDocuments = true,
+    void Function(Object error)? onError,
+  }) async {
+    if (_isStreaming) {
+      return _sessionId!;
+    }
+
+    _frameStride = math.max(1, frameStride);
+    _overlayInterval = overlayFps <= 0
+        ? Duration.zero
+        : Duration(milliseconds: (1000 / overlayFps).round());
+    _onError = onError;
+
+    final baseDir = writeToDocuments
+        ? await getApplicationDocumentsDirectory()
+        : await getTemporaryDirectory();
+    final sessionId = DateTime.now().millisecondsSinceEpoch.toString();
+    final sessionDir = Directory(p.join(baseDir.path, 'FitPerfect', sessionId));
+    if (!await sessionDir.exists()) {
+      await sessionDir.create(recursive: true);
+    }
+    final jsonlFile = File(p.join(sessionDir.path, 'coco_2d.jsonl'));
+    if (await jsonlFile.exists()) {
+      await jsonlFile.delete();
+    }
+    _jsonlSink = jsonlFile.openWrite(mode: FileMode.writeOnlyAppend);
+    _jsonlPath = jsonlFile.path;
+    _sessionDir = sessionDir;
+    _sessionId = sessionId;
+    _frameCounter = 0;
+    _processingFrame = false;
+    _lastOverlayEmit = DateTime.fromMillisecondsSinceEpoch(0);
+
+    await _startWorker();
+    await _cameraController.startImageStream(_onCameraFrame);
+
+    _isStreaming = true;
+    return sessionId;
+  }
+
+  /// Stops processing, finalizes JSONL, runs MotionBERT if configured, and
+  /// returns the JSONL path.
+  Future<String> stop() async {
+    if (!_isStreaming) {
+      return _jsonlPath ?? '';
+    }
+    _isStreaming = false;
+
+    try {
+      await _cameraController.stopImageStream();
+    } catch (_) {
+      // Camera might already be stopped; ignore.
+    }
+
+    if (_workerSendPort != null) {
+      _workerSendPort!.send(const {'type': 'stop'});
+    }
+    await _workerExitCompleter?.future;
+    await _disposeWorker();
+
+    await _jsonlSink?.flush();
+    await _jsonlSink?.close();
+    _jsonlSink = null;
+    final jsonlPath = _jsonlPath ?? '';
+
+    if (_motionBertCallback != null && _sessionId != null && _sessionDir != null) {
+      try {
+        await _motionBertCallback!(_sessionId!, _sessionDir!.path, jsonlPath);
+      } catch (err) {
+        _onError?.call(err);
+      }
+    }
+
+    return jsonlPath;
+  }
+
+  Future<void> dispose() async {
+    if (_isStreaming) {
+      await stop();
+    }
+    await _disposeWorker();
+    await _overlayController.close();
+  }
+
+  Future<void> _startWorker() async {
+    final workerPort = ReceivePort();
+    final errorPort = ReceivePort();
+    final exitPort = ReceivePort();
+    final ready = Completer<void>();
+
+    _workerPort = workerPort;
+    _workerErrorPort = errorPort;
+    _workerExitPort = exitPort;
+    _workerExitCompleter = Completer<void>();
+
+    _workerErrorSubscription = errorPort.listen((dynamic message) {
+      if (message is List && message.length >= 2) {
+        final error = message[0];
+        final stack = message[1];
+        if (kDebugMode) {
+          debugPrint('[LivePoseEngine] Worker error: $error\n$stack');
+        }
+        _onError?.call(error);
+      }
+    });
+
+    exitPort.listen((_) {
+      _workerExitCompleter?.complete();
+    });
+
+    _workerSubscription = workerPort.listen((dynamic message) {
+      if (message is Map && message['type'] == 'ready') {
+        _workerSendPort = message['port'] as SendPort;
+        ready.complete();
+        return;
+      }
+      if (message is Map && message['type'] == 'frameResult') {
+        _handleFrameResult(message);
+      } else if (message is Map && message['type'] == 'error') {
+        _processingFrame = false;
+        final err = message['error'];
+        _onError?.call(err is Object ? err : Exception(err.toString()));
+      }
+    });
+
+    final initMessage = _WorkerInitMessage(
+      sendPort: workerPort.sendPort,
+      options: _options,
+      modelConfig: _modelConfig,
+    );
+
+    await Isolate.spawn<_WorkerInitMessage>(
+      _poseWorkerMain,
+      initMessage,
+      onError: errorPort.sendPort,
+      onExit: exitPort.sendPort,
+    );
+
+    await ready.future;
+  }
+
+  Future<void> _disposeWorker() async {
+    await _workerSubscription?.cancel();
+    await _workerErrorSubscription?.cancel();
+    _workerPort?.close();
+    _workerErrorPort?.close();
+    _workerExitPort?.close();
+    _workerSubscription = null;
+    _workerErrorSubscription = null;
+    _workerPort = null;
+    _workerErrorPort = null;
+    _workerExitPort = null;
+    _workerSendPort = null;
+    _workerIsolate = null;
+  }
+
+  void _onCameraFrame(CameraImage image) {
+    if (!_isStreaming || _workerSendPort == null) {
+      return;
+    }
+    if (_processingFrame) {
+      return; // Drop frame when worker is busy (latest-wins policy).
+    }
+    final currentIndex = _frameCounter++;
+    if ((currentIndex % _frameStride) != 0) {
+      return;
+    }
+
+    _processingFrame = true;
+
+    Future.microtask(() async {
+      try {
+        final rgbImage = yuv420ToImage(image);
+        final rgbBytes = _imageToRgbBytes(rgbImage);
+        final payload = <String, Object?>{
+          'type': 'frame',
+          'frameIndex': currentIndex,
+          'width': rgbImage.width,
+          'height': rgbImage.height,
+          'timestamp': DateTime.now().microsecondsSinceEpoch,
+          'rgb': TransferableTypedData.fromList([rgbBytes]),
+        };
+        _workerSendPort?.send(payload);
+      } catch (err) {
+        _processingFrame = false;
+        _onError?.call(err is Object ? err : Exception(err.toString()));
+      }
+    });
+  }
+
+  void _handleFrameResult(Map<dynamic, dynamic> message) {
+    _processingFrame = false;
+    final jsonLine = message['jsonl'] as String?;
+    if (jsonLine != null) {
+      _jsonlSink?.writeln(jsonLine);
+    }
+
+    final now = DateTime.now();
+    if (_overlayController.isClosed) {
+      return;
+    }
+
+    if (_overlayInterval == Duration.zero ||
+        now.difference(_lastOverlayEmit) >= _overlayInterval) {
+      _lastOverlayEmit = now;
+      final overlay = OverlayData(
+        frameIndex: message['frameIndex'] as int? ?? 0,
+        bbox: (message['bbox'] as List?)?.cast<double>() ?? const [],
+        keypoints: (message['keypoints'] as List?)
+                ?.map<List<double>>((dynamic row) =>
+                    (row as List).map((e) => (e as num).toDouble()).toList())
+                .toList() ??
+            const [],
+        confidence: (message['confidence'] as num?)?.toDouble() ?? 0.0,
+        timestampUs: message['timestamp'] as int? ?? 0,
+      );
+      _overlayController.add(overlay);
+    }
+  }
+
+  static Uint8List _imageToRgbBytes(img.Image image) {
+    final out = Uint8List(image.width * image.height * 3);
+    int offset = 0;
+    for (int y = 0; y < image.height; y++) {
+      for (int x = 0; x < image.width; x++) {
+        final pixel = image.getPixel(x, y);
+        out[offset++] = img.getRed(pixel);
+        out[offset++] = img.getGreen(pixel);
+        out[offset++] = img.getBlue(pixel);
+      }
+    }
+    return out;
+  }
+}
+
 /// YOLO inference callback signature.
 /// Must return the raw detection tensor as flattened Float32List of shape [1,84,N].
-typedef YoloRun = Future<Float32List> Function(Float32List chwInput /*[1,3,640,640]*/);
+typedef YoloRun = Future<Float32List> Function(Float32List chwInput);
 
 /// RTMPose inference callback signature.
 /// Must return {'simcc_x': Float32List[1,17,Wx], 'simcc_y': Float32List[1,17,Hy]}.
-typedef RtmRun = Future<Map<String, Float32List>> Function(Float32List chwInput /*[1,3,256,192]*/);
+typedef RtmRun = Future<Map<String, Float32List>> Function(Float32List chwInput);
 
 /// Per-frame output for overlay and logging.
 class LivePoseFrame {
@@ -87,8 +409,10 @@ class LivePoseFrame {
   final List<List<double>> kptsCoco;
   /// Mean keypoint confidence for quick QA.
   final double confMean;
+  /// Serialized JSONL line describing the frame.
+  final String jsonl;
 
-  LivePoseFrame(this.t, this.bbox, this.kptsCoco, this.confMean);
+  LivePoseFrame(this.t, this.bbox, this.kptsCoco, this.confMean, this.jsonl);
 }
 
 class LivePose {
@@ -97,8 +421,6 @@ class LivePose {
   final YoloRun _yoloRun;
   final RtmRun _rtmRun;
 
-  late IOSink _jsonlSink;
-  late String _jsonlPath;
   int _t = 0;
   List<double>? _prevBbox; // prev detection for stability
 
@@ -107,45 +429,77 @@ class LivePose {
     required YoloRun yoloRun,
     required RtmRun rtmRun,
   }) async {
-    return LivePose._(options, yoloRun, rtmRun);
+    final live = LivePose._(options, yoloRun, rtmRun);
+    live._t = 0;
+    live._prevBbox = null;
+    return live;
   }
 
-  Future<void> startRecording() async {
-    final dir = await getTemporaryDirectory();
-    _jsonlPath = '${dir.path}/coco_2d.jsonl';
-    final file = File(_jsonlPath);
-    if (await file.exists()) await file.delete();
-    _jsonlSink = file.openWrite(mode: FileMode.writeOnlyAppend);
+  void reset() {
     _t = 0;
     _prevBbox = null;
   }
 
-  Future<String> stopRecording() async {
-    await _jsonlSink.flush();
-    await _jsonlSink.close();
-    return _jsonlPath;
-  }
-
   /// Process one RGB frame (packed RGB uint8, HxWx3).
-  Future<LivePoseFrame> processFrameRgb(Uint8List rgb, int width, int height) async {
+  Future<LivePoseFrame> processFrameRgb(
+      Uint8List rgb, int width, int height) async {
     // 1) Letterbox to [640,640], keep r, dw, dh
-    final lb = _letterbox(rgb, width, height, options.yoloInput, options.yoloInput, pad: options.padColor);
+    final lb = _letterbox(
+      rgb,
+      width,
+      height,
+      options.yoloInput,
+      options.yoloInput,
+      pad: options.padColor,
+    );
 
-    // 2) YOLO input [1,3,640,640] float32 normalized depending on preproc (RGB/255)
-    final yoloIn = _rgbToCHWFloat(lb.image, lb.canvasW, lb.canvasH, divideBy255: true);
+    // 2) YOLO input [1,3,640,640] float32 normalized depending on preproc
+    final yoloIn = _rgbToCHWFloat(
+      lb.image,
+      lb.canvasW,
+      lb.canvasH,
+      divideBy255: true,
+    );
     final yoloOut = await _yoloRun(yoloIn); // flattened [1,84,N]
-    final int n = yoloOut.length ~/ 84; // assume [1,84,N]
+    final int n = yoloOut.isEmpty ? 0 : yoloOut.length ~/ 84;
     if (n == 0) {
       // no detections was returned; fallback
       final bbox = _fallbackBox(width, height);
-      final crop = _cropToAspect(rgb, width, height, bbox, options.rtmH, options.rtmW, scale: options.cropScale);
-      final rtmIn = _rgbToCHWFloat(crop.image, options.rtmW, options.rtmH, divideBy255: options.rtmPreproc.endsWith('255'));
+      final crop = _cropToAspect(
+        rgb,
+        width,
+        height,
+        bbox,
+        options.rtmH,
+        options.rtmW,
+        scale: options.cropScale,
+      );
+      final rtmIn = _rgbToCHWFloat(
+        crop.image,
+        options.rtmW,
+        options.rtmH,
+        divideBy255: options.rtmPreproc.endsWith('255'),
+      );
       final simcc = await _rtmRun(rtmIn);
-      final coords = _simccDecode(simcc['simcc_x']!, simcc['simcc_y']!, options.simccRatio, options.simccX, options.simccY);
+      final tensors = _requireSimcc(simcc);
+      final coords = _simccDecode(
+        tensors.x,
+        tensors.y,
+        options.simccRatio,
+        options.simccX,
+        options.simccY,
+      );
       final coco = _coordsToImage(coords, crop.rect, options.rtmW, options.rtmH);
       final confMean = _mean(coco.map((e) => e[2]).toList());
-      final frame = LivePoseFrame(_t, bbox, coco, confMean);
-      await _writeJsonl(_t, bbox, confMean, coco);
+      final jsonl = _encodeJsonl(
+        _t,
+        bbox,
+        confMean,
+        coco,
+        imgW: width,
+        imgH: height,
+      );
+      final frame = LivePoseFrame(_t, bbox, coco, confMean, jsonl);
       _t += 1;
       return frame;
     }
@@ -154,7 +508,7 @@ class LivePose {
     final preds = _transpose84NToN84(yoloOut, n);
 
     // 4) Compute classes & scores
-    final int C = 80; // COCO-80
+    const int C = 80; // COCO-80
     final scores = Float32List(n);
     final ids = Int32List(n);
     for (int i = 0; i < n; i++) {
@@ -163,7 +517,10 @@ class LivePose {
       int bestId = -1;
       for (int c = 0; c < C; c++) {
         final v = _sigmoid(preds[i][4 + c]);
-        if (v > bestScore) { bestScore = v; bestId = c; }
+        if (v > bestScore) {
+          bestScore = v;
+          bestId = c;
+        }
       }
       scores[i] = bestScore;
       ids[i] = bestId;
@@ -172,7 +529,8 @@ class LivePose {
     // 5) Keep person class and score threshold
     final keepPerson = <int>[];
     for (int i = 0; i < n; i++) {
-      if (ids[i] == options.personClassId && scores[i] >= options.personConf) keepPerson.add(i);
+      if (ids[i] == options.personClassId &&
+          scores[i] >= options.personConf) keepPerson.add(i);
     }
 
     // 6) Boxes (cx,cy,w,h) → xyxy in letterbox domain
@@ -191,14 +549,41 @@ class LivePose {
     if (boxesLb.isEmpty) {
       // fallback to previous/center
       final bbox = _prevBbox ?? _fallbackBox(width, height);
-      final crop = _cropToAspect(rgb, width, height, bbox, options.rtmH, options.rtmW, scale: options.cropScale);
-      final rtmIn = _rgbToCHWFloat(crop.image, options.rtmW, options.rtmH, divideBy255: options.rtmPreproc.endsWith('255'));
+      final crop = _cropToAspect(
+        rgb,
+        width,
+        height,
+        bbox,
+        options.rtmH,
+        options.rtmW,
+        scale: options.cropScale,
+      );
+      final rtmIn = _rgbToCHWFloat(
+        crop.image,
+        options.rtmW,
+        options.rtmH,
+        divideBy255: options.rtmPreproc.endsWith('255'),
+      );
       final simcc = await _rtmRun(rtmIn);
-      final coords = _simccDecode(simcc['simcc_x']!, simcc['simcc_y']!, options.simccRatio, options.simccX, options.simccY);
+      final tensors = _requireSimcc(simcc);
+      final coords = _simccDecode(
+        tensors.x,
+        tensors.y,
+        options.simccRatio,
+        options.simccX,
+        options.simccY,
+      );
       final coco = _coordsToImage(coords, crop.rect, options.rtmW, options.rtmH);
       final confMean = _mean(coco.map((e) => e[2]).toList());
-      final frame = LivePoseFrame(_t, bbox, coco, confMean);
-      await _writeJsonl(_t, bbox, confMean, coco);
+      final jsonl = _encodeJsonl(
+        _t,
+        bbox,
+        confMean,
+        coco,
+        imgW: width,
+        imgH: height,
+      );
+      final frame = LivePoseFrame(_t, bbox, coco, confMean, jsonl);
       _t += 1;
       return frame;
     }
@@ -224,8 +609,12 @@ class LivePose {
         final x2 = (b[2] - lb.dw) / lb.r;
         final y1 = (b[1] - lb.dh) / lb.r;
         final y2 = (b[3] - lb.dh) / lb.r;
-        boxesImg.add([_clip(x1, 0, width - 1), _clip(y1, 0, height - 1),
-                      _clip(x2, 0, width - 1), _clip(y2, 0, height - 1)]);
+        boxesImg.add([
+          _clip(x1, 0, width - 1),
+          _clip(y1, 0, height - 1),
+          _clip(x2, 0, width - 1),
+          _clip(y2, 0, height - 1)
+        ]);
       }
     }
 
@@ -233,14 +622,41 @@ class LivePose {
     final keep = _nms(boxesImg, scoresPerson, options.personIou, 50);
     if (keep.isEmpty) {
       final bbox = _prevBbox ?? _fallbackBox(width, height);
-      final crop = _cropToAspect(rgb, width, height, bbox, options.rtmH, options.rtmW, scale: options.cropScale);
-      final rtmIn = _rgbToCHWFloat(crop.image, options.rtmW, options.rtmH, divideBy255: options.rtmPreproc.endsWith('255'));
+      final crop = _cropToAspect(
+        rgb,
+        width,
+        height,
+        bbox,
+        options.rtmH,
+        options.rtmW,
+        scale: options.cropScale,
+      );
+      final rtmIn = _rgbToCHWFloat(
+        crop.image,
+        options.rtmW,
+        options.rtmH,
+        divideBy255: options.rtmPreproc.endsWith('255'),
+      );
       final simcc = await _rtmRun(rtmIn);
-      final coords = _simccDecode(simcc['simcc_x']!, simcc['simcc_y']!, options.simccRatio, options.simccX, options.simccY);
+      final tensors = _requireSimcc(simcc);
+      final coords = _simccDecode(
+        tensors.x,
+        tensors.y,
+        options.simccRatio,
+        options.simccX,
+        options.simccY,
+      );
       final coco = _coordsToImage(coords, crop.rect, options.rtmW, options.rtmH);
       final confMean = _mean(coco.map((e) => e[2]).toList());
-      final frame = LivePoseFrame(_t, bbox, coco, confMean);
-      await _writeJsonl(_t, bbox, confMean, coco);
+      final jsonl = _encodeJsonl(
+        _t,
+        bbox,
+        confMean,
+        coco,
+        imgW: width,
+        imgH: height,
+      );
+      final frame = LivePoseFrame(_t, bbox, coco, confMean, jsonl);
       _t += 1;
       return frame;
     }
@@ -250,44 +666,81 @@ class LivePose {
     _prevBbox = bbox;
 
     // 10) Crop→256x192 + RTMPose
-    final crop = _cropToAspect(rgb, width, height, bbox, options.rtmH, options.rtmW, scale: options.cropScale);
+    final crop = _cropToAspect(
+      rgb,
+      width,
+      height,
+      bbox,
+      options.rtmH,
+      options.rtmW,
+      scale: options.cropScale,
+    );
     final preDiv255 = options.rtmPreproc.endsWith('255');
-    final rtmIn = _rgbToCHWFloat(crop.image, options.rtmW, options.rtmH, divideBy255: preDiv255);
+    final rtmIn = _rgbToCHWFloat(
+      crop.image,
+      options.rtmW,
+      options.rtmH,
+      divideBy255: preDiv255,
+    );
     final simcc = await _rtmRun(rtmIn);
+    final tensors = _requireSimcc(simcc);
 
     // 11) SimCC decode and map back to image
-    final coords = _simccDecode(simcc['simcc_x']!, simcc['simcc_y']!, options.simccRatio, options.simccX, options.simccY);
+    final coords = _simccDecode(
+      tensors.x,
+      tensors.y,
+      options.simccRatio,
+      options.simccX,
+      options.simccY,
+    );
     final coco = _coordsToImage(coords, crop.rect, options.rtmW, options.rtmH);
     final confMean = _mean(coco.map((e) => e[2]).toList());
 
     // 12) Save JSONL (normalized bbox like Python)
-    await _writeJsonl(_t, bbox, confMean, coco, imgW: width, imgH: height);
+    final jsonl = _encodeJsonl(
+      _t,
+      bbox,
+      confMean,
+      coco,
+      imgW: width,
+      imgH: height,
+    );
 
-    final frame = LivePoseFrame(_t, bbox, coco, confMean);
+    final frame = LivePoseFrame(_t, bbox, coco, confMean, jsonl);
     _t += 1;
     return frame;
   }
 
-  // ----------------- Internals -----------------
-
-  double _clip(double v, double lo, double hi) => v < lo ? lo : (v > hi ? hi : v);
-
-  Future<void> _writeJsonl(int t, List<double> bbox, double score, List<List<double>> coco,
-      {int? imgW, int? imgH}) async {
+  String _encodeJsonl(
+    int t,
+    List<double> bbox,
+    double score,
+    List<List<double>> coco, {
+    int? imgW,
+    int? imgH,
+  }) {
     final w = (imgW ?? 1).toDouble();
     final h = (imgH ?? 1).toDouble();
     final line = {
-      "t": t,
-      "bbox": [bbox[0]/w, bbox[1]/h, bbox[2]/w, bbox[3]/h],
-      "score": score,
-      "yolo_output_units": options.yoloUnits,
-      "yolo_output_coords": options.yoloCoords,
-      "kpt_coco": coco,
+      't': t,
+      'bbox': [bbox[0] / w, bbox[1] / h, bbox[2] / w, bbox[3] / h],
+      'score': score,
+      'yolo_output_units': options.yoloUnits,
+      'yolo_output_coords': options.yoloCoords,
+      'kpt_coco': coco,
     };
-    _jsonlSink.writeln(jsonEncode(line));
+    return jsonEncode(line);
   }
 
-  List<List<double>> _coordsToImage(List<List<double>> coordsIn, _Rect rect, int inW, int inH) {
+  // ----------------- Internals -----------------
+
+  double _clip(double v, double lo, double hi) =>
+      v < lo
+          ? lo
+          : (v > hi ? hi : v);
+
+  List<List<double>> _coordsToImage(
+      List<List<double>> coordsIn, _Rect rect, int inW, int inH) {
     final rx = rect.x, ry = rect.y, rw = rect.w, rh = rect.h;
     final out = <List<double>>[];
     for (final p in coordsIn) {
@@ -298,22 +751,36 @@ class LivePose {
     return out;
   }
 
-  List<List<double>> _simccDecode(Float32List simccX, Float32List simccY, double splitRatio, int Wx, int Hy) {
+  List<List<double>> _simccDecode(
+    Float32List simccX,
+    Float32List simccY,
+    double splitRatio,
+    int Wx,
+    int Hy,
+  ) {
     // Shapes: [1,17,Wx], [1,17,Hy]
     const K = 17;
     final px = _softmaxLast(simccX, K, Wx);
     final py = _softmaxLast(simccY, K, Hy);
     final out = <List<double>>[];
     for (int k = 0; k < K; k++) {
-      int argx = 0; double maxx = -1;
+      int argx = 0;
+      double maxx = -1;
       for (int i = 0; i < Wx; i++) {
         final v = px[k * Wx + i];
-        if (v > maxx) { maxx = v; argx = i; }
+        if (v > maxx) {
+          maxx = v;
+          argx = i;
+        }
       }
-      int argy = 0; double maxy = -1;
+      int argy = 0;
+      double maxy = -1;
       for (int j = 0; j < Hy; j++) {
         final v = py[k * Hy + j];
-        if (v > maxy) { maxy = v; argy = j; }
+        if (v > maxy) {
+          maxy = v;
+          argy = j;
+        }
       }
       final x = argx / splitRatio;
       final y = argy / splitRatio;
@@ -348,9 +815,10 @@ class LivePose {
 
   double _sigmoid(double x) => 1.0 / (1.0 + math.exp(-x));
 
-  List<int> _nms(List<List<double>> boxes, List<double> scores, double iouThr, int maxDet) {
+  List<int> _nms(
+      List<List<double>> boxes, List<double> scores, double iouThr, int maxDet) {
     final idxs = List<int>.generate(boxes.length, (i) => i);
-    idxs.sort((a,b) => scores[b].compareTo(scores[a]));
+    idxs.sort((a, b) => scores[b].compareTo(scores[a]));
     final keep = <int>[];
     while (idxs.isNotEmpty && keep.length < maxDet) {
       final i = idxs.removeAt(0);
@@ -375,14 +843,19 @@ class LivePose {
   double _mean(List<double> v) {
     if (v.isEmpty) return 0.0;
     double s = 0.0;
-    for (final x in v) s += x;
+    for (final x in v) {
+      s += x;
+    }
     return s / v.length;
   }
 
   List<List<double>> _transpose84NToN84(Float32List flat84N, int N) {
     // Input shape [1,84,N]; ONNX is row-major (last dim contiguous).
     // So flat84N is laid out as 84 blocks of size N: [84][N].
-    final out = List<List<double>>.generate(N, (_) => List<double>.filled(84, 0.0));
+    final out = List<List<double>>.generate(
+      N,
+      (_) => List<double>.filled(84, 0.0),
+    );
     int idx = 0;
     for (int c = 0; c < 84; c++) {
       for (int i = 0; i < N; i++) {
@@ -392,7 +865,14 @@ class LivePose {
     return out;
   }
 
-  _LetterboxResult _letterbox(Uint8List rgb, int w, int h, int tw, int th, {List<int> pad = const [114,114,114]}) {
+  _LetterboxResult _letterbox(
+    Uint8List rgb,
+    int w,
+    int h,
+    int tw,
+    int th, {
+    List<int> pad = const [114, 114, 114],
+  }) {
     final r = math.min(th / h, tw / w);
     final newW = (w * r).round();
     final newH = (h * r).round();
@@ -400,13 +880,13 @@ class LivePose {
     final dwf = (tw - newW) / 2.0;
     final dhf = (th - newH) / 2.0;
     final left = dwf.floor();
-    final top  = dhf.floor();
+    final top = dhf.floor();
     final canvas = Uint8List(tw * th * 3);
     // fill pad color
     for (int i = 0; i < canvas.length; i += 3) {
-      canvas[i+0] = pad[0];
-      canvas[i+1] = pad[1];
-      canvas[i+2] = pad[2];
+      canvas[i + 0] = pad[0];
+      canvas[i + 1] = pad[1];
+      canvas[i + 2] = pad[2];
     }
     // blit resized into canvas at (left, top)
     for (int y = 0; y < newH; y++) {
@@ -424,7 +904,8 @@ class LivePose {
     );
   }
 
-  Uint8List _resizeRgbNearest(Uint8List src, int sw, int sh, int dw, int dh) {
+  Uint8List _resizeRgbNearest(
+      Uint8List src, int sw, int sh, int dw, int dh) {
     final out = Uint8List(dw * dh * 3);
     final xRatio = sw / dw;
     final yRatio = sh / dh;
@@ -434,15 +915,22 @@ class LivePose {
         final sx = (x * xRatio).floor().clamp(0, sw - 1);
         final sIdx = (sy * sw + sx) * 3;
         final dIdx = (y * dw + x) * 3;
-        out[dIdx]   = src[sIdx];
-        out[dIdx+1] = src[sIdx+1];
-        out[dIdx+2] = src[sIdx+2];
+        out[dIdx] = src[sIdx];
+        out[dIdx + 1] = src[sIdx + 1];
+        out[dIdx + 2] = src[sIdx + 2];
       }
     }
     return out;
   }
 
-  Float32List _rgbToCHWFloat(Uint8List rgb, int w, int h, {bool divideBy255 = true, List<double>? mean, List<double>? std}) {
+  Float32List _rgbToCHWFloat(
+    Uint8List rgb,
+    int w,
+    int h, {
+    bool divideBy255 = true,
+    List<double>? mean,
+    List<double>? std,
+  }) {
     final scale = divideBy255 ? 1.0 / 255.0 : 1.0;
     final out = Float32List(1 * 3 * h * w);
     int p = 0;
@@ -462,7 +950,6 @@ class LivePose {
       }
     }
     if (mean != null && std != null && mean.length == 3 && std.length == 3) {
-      // apply (x - mean)/std channel-wise
       for (int i = 0; i < h * w; i++) {
         out[offR + i] = ((out[offR + i] * 255.0) - mean[0]) / std[0];
         out[offG + i] = ((out[offG + i] * 255.0) - mean[1]) / std[1];
@@ -472,7 +959,15 @@ class LivePose {
     return out;
   }
 
-  _CropResult _cropToAspect(Uint8List rgb, int w, int h, List<double> boxXYXY, int outH, int outW, {double scale = 1.25}) {
+  _CropResult _cropToAspect(
+    Uint8List rgb,
+    int w,
+    int h,
+    List<double> boxXYXY,
+    int outH,
+    int outW, {
+    double scale = 1.25,
+  }) {
     final x1 = boxXYXY[0], y1 = boxXYXY[1], x2 = boxXYXY[2], y2 = boxXYXY[3];
     final cx = (x1 + x2) / 2.0;
     final cy = (y1 + y2) / 2.0;
@@ -480,8 +975,11 @@ class LivePose {
     double bh = (y2 - y1) * scale;
 
     final targetAr = outW / outH; // 192/256
-    if (bw / bh > targetAr) bh = bw / targetAr;
-    else bw = bh * targetAr;
+    if (bw / bh > targetAr) {
+      bh = bw / targetAr;
+    } else {
+      bw = bh * targetAr;
+    }
 
     int rx1 = math.max(0, (cx - bw / 2.0).round());
     int ry1 = math.max(0, (cy - bh / 2.0).round());
@@ -491,16 +989,15 @@ class LivePose {
     final rw = math.max(1, rx2 - rx1);
     final rh = math.max(1, ry2 - ry1);
     final crop = Uint8List(outW * outH * 3);
-    // nearest resize into outW×outH
     for (int y = 0; y < outH; y++) {
       final sy = (ry1 + (y * rh / outH)).floor().clamp(0, h - 1);
       for (int x = 0; x < outW; x++) {
         final sx = (rx1 + (x * rw / outW)).floor().clamp(0, w - 1);
         final sIdx = (sy * w + sx) * 3;
         final dIdx = (y * outW + x) * 3;
-        crop[dIdx]   = rgb[sIdx];
-        crop[dIdx+1] = rgb[sIdx+1];
-        crop[dIdx+2] = rgb[sIdx+2];
+        crop[dIdx] = rgb[sIdx];
+        crop[dIdx + 1] = rgb[sIdx + 1];
+        crop[dIdx + 2] = rgb[sIdx + 2];
       }
     }
     return _CropResult(
@@ -512,6 +1009,21 @@ class LivePose {
   List<double> _fallbackBox(int w, int h) {
     return [w * 0.25, h * 0.1, w * 0.75, h * 0.9];
   }
+
+  _SimccTensors _requireSimcc(Map<String, Float32List> tensors) {
+    final simccX = tensors['simcc_x'] ?? tensors['output_0'];
+    final simccY = tensors['simcc_y'] ?? tensors['output_1'];
+    if (simccX == null || simccY == null) {
+      throw StateError('RTMPose outputs missing simcc_x/simcc_y tensors');
+    }
+    return _SimccTensors(simccX, simccY);
+  }
+}
+
+class _SimccTensors {
+  final Float32List x;
+  final Float32List y;
+  const _SimccTensors(this.x, this.y);
 }
 
 class _LetterboxResult {
@@ -521,7 +1033,14 @@ class _LetterboxResult {
   final double r;
   final double dw;
   final double dh;
-  _LetterboxResult({required this.image, required this.canvasW, required this.canvasH, required this.r, required this.dw, required this.dh});
+  _LetterboxResult({
+    required this.image,
+    required this.canvasW,
+    required this.canvasH,
+    required this.r,
+    required this.dw,
+    required this.dh,
+  });
 }
 
 class _Rect {
@@ -534,3 +1053,168 @@ class _CropResult {
   final _Rect rect;
   const _CropResult({required this.image, required this.rect});
 }
+
+// ----------------- Worker isolate -----------------
+
+class _WorkerInitMessage {
+  final SendPort sendPort;
+  final LivePoseOptions options;
+  final LivePoseModelConfig modelConfig;
+
+  const _WorkerInitMessage({
+    required this.sendPort,
+    required this.options,
+    required this.modelConfig,
+  });
+}
+
+void _poseWorkerMain(_WorkerInitMessage init) async {
+  final controlPort = ReceivePort();
+  init.sendPort.send({'type': 'ready', 'port': controlPort.sendPort});
+
+  final options = init.options;
+  final modelConfig = init.modelConfig;
+
+  late final LivePose live;
+  late final OrtSession yoloSession;
+  late final OrtSession rtmSession;
+
+  Future<Float32List> runYolo(Float32List chwInput) async {
+    final input =
+        OrtValueTensor.createTensorWithDataList(chwInput, [1, 3, options.yoloInput, options.yoloInput]);
+    final runOptions = OrtRunOptions();
+    final outputs = await yoloSession.runAsync(runOptions, {'images': input});
+    runOptions.release();
+    input.release();
+    if (outputs == null || outputs.isEmpty) {
+      return Float32List(0);
+    }
+    final out = outputs.first!;
+    final flattened = _ortValueToFloat32List(out);
+    for (final value in outputs) {
+      value?.release();
+    }
+    return flattened;
+  }
+
+  Future<Map<String, Float32List>> runRtm(Float32List chwInput) async {
+    final input =
+        OrtValueTensor.createTensorWithDataList(chwInput, [1, 3, options.rtmH, options.rtmW]);
+    final runOptions = OrtRunOptions();
+    final outputs = await rtmSession.runAsync(runOptions, {'input': input});
+    runOptions.release();
+    input.release();
+    final result = <String, Float32List>{};
+    if (outputs != null) {
+      final names = rtmSession.outputNames;
+      for (int i = 0; i < outputs.length; i++) {
+        final value = outputs[i];
+        if (value == null) continue;
+        final name = (names.length > i) ? names[i] : 'output_$i';
+        result[name] = _ortValueToFloat32List(value);
+      }
+      for (final value in outputs) {
+        value?.release();
+      }
+      result['simcc_x'] ??= result['output_0'] ?? result['0'];
+      result['simcc_y'] ??= result['output_1'] ?? result['1'];
+    }
+    return result;
+  }
+
+  try {
+    yoloSession = await OrtManager.fromAssetWithProviders(
+      modelConfig.yoloAssetPath,
+      providers: modelConfig.yoloProviders,
+    );
+    rtmSession = await OrtManager.fromAssetWithProviders(
+      modelConfig.rtmAssetPath,
+      providers: modelConfig.rtmProviders,
+    );
+    live = await LivePose.create(
+      options: options,
+      yoloRun: runYolo,
+      rtmRun: runRtm,
+    );
+  } catch (err, stack) {
+    init.sendPort.send({'type': 'error', 'error': err, 'stack': stack.toString()});
+    controlPort.close();
+    return;
+  }
+
+  await for (final dynamic message in controlPort) {
+    if (message is Map && message['type'] == 'frame') {
+      try {
+        final TransferableTypedData data = message['rgb'] as TransferableTypedData;
+        final Uint8List rgb = data.materialize().asUint8List();
+        final frameIndex = message['frameIndex'] as int? ?? 0;
+        final width = message['width'] as int? ?? 0;
+        final height = message['height'] as int? ?? 0;
+        final timestamp = message['timestamp'] as int? ?? 0;
+        final frame = await live.processFrameRgb(rgb, width, height);
+        init.sendPort.send({
+          'type': 'frameResult',
+          'frameIndex': frameIndex,
+          'bbox': frame.bbox,
+          'keypoints': frame.kptsCoco,
+          'confidence': frame.confMean,
+          'jsonl': frame.jsonl,
+          'timestamp': timestamp,
+        });
+      } catch (err, stack) {
+        init.sendPort.send({
+          'type': 'error',
+          'error': err,
+          'stack': stack.toString(),
+        });
+      }
+    } else if (message is Map && message['type'] == 'stop') {
+      break;
+    }
+  }
+
+  try {
+    yoloSession.release();
+  } catch (_) {}
+  try {
+    rtmSession.release();
+  } catch (_) {}
+  controlPort.close();
+}
+
+Float32List _ortValueToFloat32List(OrtValue value) {
+  final dynamic raw = value.value;
+  final length = _countElements(raw);
+  final flat = Float32List(length);
+  _fillFlat(raw, flat, 0);
+  return flat;
+}
+
+int _countElements(dynamic value) {
+  if (value is List) {
+    int count = 0;
+    for (final v in value) {
+      count += _countElements(v);
+    }
+    return count;
+  }
+  if (value is num) {
+    return 1;
+  }
+  return 0;
+}
+
+int _fillFlat(dynamic value, Float32List out, int offset) {
+  if (value is List) {
+    for (final v in value) {
+      offset = _fillFlat(v, out, offset);
+    }
+    return offset;
+  }
+  if (value is num) {
+    out[offset] = value.toDouble();
+    return offset + 1;
+  }
+  return offset;
+}
+
