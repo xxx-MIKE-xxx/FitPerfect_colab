@@ -2,381 +2,343 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
-import 'pose_runtime.dart';
+/// Identifies the current lifecycle state of the processing controller.
+enum ProcessingState { idle, streaming, stopping, running3D, done, error }
 
-typedef SessionId = String;
-
-class VideoMeta {
-  VideoMeta({
+/// Session metadata returned when starting a live capture run.
+class SessionInfo {
+  SessionInfo({
     required this.sessionId,
-    required this.fps,
-    required this.width,
-    required this.height,
-    required this.exercise,
-    required this.startTime,
-    required this.endTime,
-    required this.platform,
-    required this.appVersion,
+    required this.dir,
+    required this.jsonlPath,
   });
 
-  final SessionId sessionId;
-  final double fps;
-  final int width;
-  final int height;
-  final String exercise;
-  final DateTime startTime;
-  final DateTime endTime;
-  final String platform;
-  final String appVersion;
+  final String sessionId;
+  final Directory dir;
+  final String jsonlPath;
 }
 
-enum ProgressStatus { hidden, indeterminate, determinate, complete, error, cancelled }
-
-class ProgressEvent {
-  ProgressEvent._({
-    required this.status,
-    this.phase,
-    this.value,
-    this.processed,
-    this.total,
-    this.message,
-    this.allowCancel = true,
+/// Final result produced after running MotionBERT on a captured session.
+class ProcessingResult {
+  ProcessingResult({
+    required this.jsonl2dPath,
+    required this.out3dPath,
+    this.reportPaths = const <String>[],
   });
 
-  final ProgressStatus status;
-  final String? phase;
-  final double? value;
-  final int? processed;
-  final int? total;
-  final String? message;
-  final bool allowCancel;
-
-  bool get isHidden => status == ProgressStatus.hidden;
-
-  factory ProgressEvent.hidden() =>
-      ProgressEvent._(status: ProgressStatus.hidden, allowCancel: false);
-
-  factory ProgressEvent.indeterminate({required String phase, bool allowCancel = true}) =>
-      ProgressEvent._(status: ProgressStatus.indeterminate, phase: phase, allowCancel: allowCancel);
-
-  factory ProgressEvent.determinate({
-    required String phase,
-    required double value,
-    int? processed,
-    int? total,
-    bool allowCancel = true,
-  }) =>
-      ProgressEvent._(
-        status: ProgressStatus.determinate,
-        phase: phase,
-        value: value,
-        processed: processed,
-        total: total,
-        allowCancel: allowCancel,
-      );
-
-  factory ProgressEvent.complete({String phase = 'Completed'}) =>
-      ProgressEvent._(status: ProgressStatus.complete, phase: phase, allowCancel: false, value: 1.0);
-
-  factory ProgressEvent.error(String message) => ProgressEvent._(
-        status: ProgressStatus.error,
-        phase: 'Error',
-        message: message,
-        allowCancel: false,
-      );
-
-  factory ProgressEvent.cancelled() => ProgressEvent._(
-        status: ProgressStatus.cancelled,
-        phase: 'Cancelled',
-        allowCancel: false,
-      );
+  final String jsonl2dPath;
+  final String out3dPath;
+  final List<String> reportPaths;
 }
 
-class PoseProcessingOutcome {
-  PoseProcessingOutcome({
-    required this.sessionId,
-    required this.sessionDir,
-    required this.sequence2d,
-    required this.result3d,
-    required this.summary2d,
-    required this.summary3d,
-  });
-
-  final SessionId sessionId;
-  final Directory sessionDir;
-  final Pose2DSequence sequence2d;
-  final Pose3DResult result3d;
-  final Map<String, dynamic> summary2d;
-  final Map<String, dynamic> summary3d;
-
-  Map<String, dynamic> toFeedbackReport() => {
-        'num_frames': sequence2d.frames.length,
-        'num_joints': 17,
-        'kpts2d': sequence2d.frames.map((f) => f.toRawList()).toList(),
-        'kpts3d': result3d.sequence,
-        'meta': {
-          'fps': sequence2d.fps,
-          'window': result3d.windowSize,
-          'stride': result3d.stride,
-        },
-      };
-}
-
-class PoseProcessingCancelled implements Exception {
-  const PoseProcessingCancelled();
-}
-
+/// Controller that orchestrates the live 2D capture session and the 3D post step.
 class PoseProcessingController {
-  PoseProcessingController({PosePipeline? pipeline}) : _pipeline = pipeline ?? PosePipeline();
+  PoseProcessingController({
+    required LivePoseEngine engine,
+    MotionBertRunner? motionBertRunner,
+  })  : _engine = engine,
+        _motionBertRunner = motionBertRunner ?? const MotionBertRunner();
 
-  final PosePipeline _pipeline;
-  final _progressCtrl = StreamController<ProgressEvent>.broadcast();
-  bool _processing = false;
-  bool _cancelRequested = false;
+  final LivePoseEngine _engine;
+  final MotionBertRunner _motionBertRunner;
 
-  Stream<ProgressEvent> get progressStream => _progressCtrl.stream;
-  bool get isProcessing => _processing;
+  final _stateCtl = StreamController<ProcessingState>.broadcast();
+  final _errCtl = StreamController<Object>.broadcast();
 
-  Future<PoseProcessingOutcome> processRecording({
-    required File videoFile,
-    required VideoMeta meta,
+  StreamSubscription<Object>? _engineErrSub;
+  ProcessingState _state = ProcessingState.idle;
+  SessionInfo? _activeSession;
+  IOSink? _jsonlSink;
+  bool _disposed = false;
+
+  Stream<ProcessingState> get state => _stateCtl.stream;
+
+  Stream<Object> get errors => _errCtl.stream;
+
+  ProcessingState get currentState => _state;
+
+  /// Starts the live pose engine and opens the JSONL writer for the session.
+  Future<SessionInfo> startLive({
+    int frameStride = 3,
+    bool writeToDocuments = true,
   }) async {
-    if (_processing) {
-      throw StateError('Processing already in progress');
+    _ensureNotDisposed();
+    if (_state != ProcessingState.idle &&
+        _state != ProcessingState.done &&
+        _state != ProcessingState.error) {
+      throw StateError('Cannot start a new session while $_state');
     }
 
-    _processing = true;
-    _cancelRequested = false;
+    await _teardownSession();
 
-    Directory? sessionDir;
+    final sessionId = generateSessionId();
+    final baseDir =
+        writeToDocuments ? await _documentsDir() : await _temporaryDir();
+    final sessionDir = Directory(p.join(baseDir.path, 'FitPerfect', sessionId));
+    await sessionDir.create(recursive: true);
+
+    final jsonlFile = File(p.join(sessionDir.path, 'coco_2d.jsonl'));
+    final sink = jsonlFile.openWrite(mode: FileMode.append);
+
+    final session = SessionInfo(
+      sessionId: sessionId,
+      dir: sessionDir,
+      jsonlPath: jsonlFile.path,
+    );
+
+    _jsonlSink = sink;
+    _activeSession = session;
+
+    _setState(ProcessingState.streaming);
+
+    await _engineErrSub?.cancel();
+    _engineErrSub = _engine.errors.listen(
+      (error) => _errCtl.add(error),
+      onError: (Object error, StackTrace stackTrace) {
+        _errCtl.add(error);
+        _setState(ProcessingState.error);
+      },
+    );
 
     try {
-      sessionDir = await _prepareSessionDir(meta.sessionId);
-      final dir2d = Directory(p.join(sessionDir.path, '2d'))..createSync(recursive: true);
-      final dir3d = Directory(p.join(sessionDir.path, '3d'))..createSync(recursive: true);
-
-      _progressCtrl.add(ProgressEvent.indeterminate(phase: 'Finalizing 2D frames'));
-      final seq2d = await _pipeline.extract2D(
-        videoFile,
-        targetFps: meta.fps,
-        shouldAbort: () => _cancelRequested,
+      await _engine.start(
+        session: session,
+        jsonlSink: sink,
+        frameStride: frameStride,
       );
-
-      if (_cancelRequested) {
-        throw const PoseProcessingCancelled();
-      }
-
-      await _write2D(dir2d, seq2d);
-      final summary2d = _build2DIndex(seq2d, meta);
-
-      _progressCtrl.add(ProgressEvent.indeterminate(phase: 'Preparing 3D input'));
-
-      final result3d = await _pipeline.estimate3D(
-        seq2d,
-        onProgress: (progress) {
-          if (_cancelRequested) return;
-          if (progress.phase == PosePipelinePhase.running3d) {
-            _progressCtrl.add(
-              ProgressEvent.determinate(
-                phase: 'Estimating 3D poses',
-                value: progress.fraction,
-                processed: progress.processed,
-                total: progress.total,
-              ),
-            );
-          }
-        },
-        shouldAbort: () => _cancelRequested,
-      );
-
-      if (_cancelRequested) {
-        throw const PoseProcessingCancelled();
-      }
-
-      await _write3D(dir3d, result3d);
-      final summary3d = _build3DIndex(result3d);
-
-      await _writeMeta(sessionDir, meta, summary2d, summary3d);
-
-      _progressCtrl.add(ProgressEvent.complete(phase: '3D analysis complete'));
-
-      return PoseProcessingOutcome(
-        sessionId: meta.sessionId,
-        sessionDir: sessionDir,
-        sequence2d: seq2d,
-        result3d: result3d,
-        summary2d: summary2d,
-        summary3d: summary3d,
-      );
-    } on PoseProcessingCancelled {
-      if (sessionDir != null) {
-        await _deleteDir(sessionDir);
-      }
-      _progressCtrl.add(ProgressEvent.cancelled());
-      throw const PoseProcessingCancelled();
-    } on PosePipelineCancelled {
-      if (sessionDir != null) {
-        await _deleteDir(sessionDir);
-      }
-      _progressCtrl.add(ProgressEvent.cancelled());
-      throw const PoseProcessingCancelled();
-    } catch (e, st) {
-      if (sessionDir != null) {
-        await _deleteDir(sessionDir);
-      }
-      if (kDebugMode) {
-        debugPrint('Pose processing failed: $e\n$st');
-      }
-      _progressCtrl.add(ProgressEvent.error(e.toString()));
+    } catch (error, stackTrace) {
+      await _handleStartFailure(error, stackTrace);
       rethrow;
-    } finally {
-      _processing = false;
-      _cancelRequested = false;
     }
+
+    return session;
   }
 
-  void cancel() {
-    if (!_processing) return;
-    _cancelRequested = true;
+  /// Stops the live engine, finalizes 2D output, and runs MotionBERT.
+  Future<ProcessingResult> stopAndRun3D() async {
+    _ensureNotDisposed();
+    final session = _activeSession;
+    final sink = _jsonlSink;
+    if (session == null || sink == null) {
+      throw StateError('No active live session to stop');
+    }
+
+    _setState(ProcessingState.stopping);
+
+    try {
+      await _engine.stop();
+    } catch (error, stackTrace) {
+      _errCtl.add(error);
+      if (kDebugMode) {
+        debugPrint('LivePoseEngine.stop error: $error\n$stackTrace');
+      }
+      _setState(ProcessingState.error);
+      rethrow;
+    }
+
+    await sink.flush();
+    await sink.close();
+    _jsonlSink = null;
+
+    final jsonlFile = File(session.jsonlPath);
+    if (!await jsonlFile.exists()) {
+      _setState(ProcessingState.error);
+      throw StateError('Expected JSONL at ${session.jsonlPath} after stop');
+    }
+    final stat = await jsonlFile.stat();
+    if (stat.size <= 0) {
+      _setState(ProcessingState.error);
+      throw StateError('JSONL file at ${session.jsonlPath} is empty');
+    }
+
+    _setState(ProcessingState.running3D);
+
+    ProcessingResult result;
+    try {
+      result = await _motionBertRunner.run(
+        jsonl2dPath: session.jsonlPath,
+        sessionDir: session.dir,
+        providers: _defaultProviders(),
+      );
+    } catch (error, stackTrace) {
+      _errCtl.add(error);
+      if (kDebugMode) {
+        debugPrint('MotionBertRunner error: $error\n$stackTrace');
+      }
+      _setState(ProcessingState.error);
+      rethrow;
+    }
+
+    _setState(ProcessingState.done);
+    _activeSession = null;
+    return result;
   }
 
+  /// Disposes resources and stops any ongoing session best-effort.
   Future<void> dispose() async {
-    await _progressCtrl.close();
-  }
+    if (_disposed) return;
+    _disposed = true;
 
-  Future<Directory> _prepareSessionDir(SessionId sessionId) async {
-    final base = await _baseDir();
-    final sessionDir = Directory(p.join(base.path, 'poses', sessionId));
-    if (sessionDir.existsSync()) {
-      await sessionDir.delete(recursive: true);
+    await _engineErrSub?.cancel();
+    _engineErrSub = null;
+
+    if (_state == ProcessingState.streaming) {
+      try {
+        await _engine.stop();
+      } catch (error, stackTrace) {
+        if (kDebugMode) {
+          debugPrint('Error stopping engine during dispose: $error\n$stackTrace');
+        }
+        _errCtl.add(error);
+      }
     }
-    await sessionDir.create(recursive: true);
-    return sessionDir;
-  }
 
-  Future<Directory> _baseDir() async {
-    final docs = await getApplicationDocumentsDirectory();
-    final base = Directory(p.join(docs.path, 'FitPerfect'));
-    if (!base.existsSync()) {
-      await base.create(recursive: true);
+    final sink = _jsonlSink;
+    if (sink != null) {
+      await sink.flush();
+      await sink.close();
+      _jsonlSink = null;
     }
-    return base;
-  }
 
-  Future<void> _write2D(Directory dir, Pose2DSequence seq) async {
-    final framesPath = File(p.join(dir.path, 'frames.jsonl'));
-    final tmp = File('${framesPath.path}.tmp');
-    final sink = tmp.openWrite();
-    for (final frame in seq.frames) {
-      sink.writeln(jsonEncode(frame.toJson()));
+    try {
+      await _engine.dispose();
+    } catch (error, stackTrace) {
+      if (kDebugMode) {
+        debugPrint('Error disposing engine: $error\n$stackTrace');
+      }
     }
-    await sink.flush();
-    await sink.close();
-    await tmp.rename(framesPath.path);
 
-    final index = _build2DIndex(seq, null);
-    await _writeJsonAtomic(File(p.join(dir.path, 'index.json')), index);
+    await _stateCtl.close();
+    await _errCtl.close();
+    _activeSession = null;
+    _setState(ProcessingState.idle);
   }
 
-  Future<void> _write3D(Directory dir, Pose3DResult result) async {
-    final windowsPath = File(p.join(dir.path, 'windows.jsonl'));
-    final tmp = File('${windowsPath.path}.tmp');
-    final sink = tmp.openWrite();
-    for (final window in result.windows) {
-      sink.writeln(jsonEncode(window.toJson()));
+  Future<Directory> _documentsDir() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return dir;
+  }
+
+  Future<Directory> _temporaryDir() async {
+    final dir = await getTemporaryDirectory();
+    return dir;
+  }
+
+  void _setState(ProcessingState next) {
+    if (_state == next) return;
+    _state = next;
+    if (!_stateCtl.isClosed) {
+      _stateCtl.add(next);
     }
-    await sink.flush();
-    await sink.close();
-    await tmp.rename(windowsPath.path);
-
-    final index = _build3DIndex(result);
-    await _writeJsonAtomic(File(p.join(dir.path, 'index.json')), index);
   }
 
-  Future<void> _writeMeta(
-    Directory dir,
-    VideoMeta meta,
-    Map<String, dynamic> index2d,
-    Map<String, dynamic> index3d,
-  ) async {
-    final cfg = _pipeline.motionBertConfig;
-    final payload = {
-      'sessionId': meta.sessionId,
-      'appVersion': meta.appVersion,
-      'platform': meta.platform,
-      'fps': meta.fps,
-      'startTime': meta.startTime.toUtc().toIso8601String(),
-      'endTime': meta.endTime.toUtc().toIso8601String(),
-      'exercise': meta.exercise,
-      'model2D': {
-        'name': 'RTM-Pose rtm-m',
-        'keypoints': 'RTM→H36M17',
-        'confidenceMin': null,
-      },
-      'model3D': {
-        'name': 'MotionBERT',
-        'onnxPath': cfg.assetPath,
-        'T': cfg.window,
-      },
-      'schemaVersion': 1,
-      'index2d': index2d,
-      'index3d': index3d,
-    };
-    await _writeJsonAtomic(File(p.join(dir.path, 'meta.json')), payload);
-  }
-
-  Map<String, dynamic> _build2DIndex(Pose2DSequence seq, VideoMeta? meta) {
-    final frames = seq.frames;
-    final timestamps = frames.isEmpty
-        ? const {'start': 0.0, 'end': 0.0}
-        : {
-            'start': double.parse(frames.first.t.toStringAsFixed(3)),
-            'end': double.parse(frames.last.t.toStringAsFixed(3)),
-          };
-    return {
-      'frameCount': frames.length,
-      'fps': seq.fps,
-      'keypointSet': 'H36M-17',
-      'schemaVersion': 1,
-      'timestamps': timestamps,
-      if (meta != null) 'imgW': meta.width,
-      if (meta != null) 'imgH': meta.height,
-    };
-  }
-
-  Map<String, dynamic> _build3DIndex(Pose3DResult result) => {
-        'windowCount': result.windows.length,
-        'skeleton': 'H36M-17',
-        'normalization': 'center-subtract, scale=min(W,H)/2',
-        'schemaVersion': 1,
-        'windowSize': result.windowSize,
-        'stride': result.stride,
-        'pelvisCentered': result.pelvisCentered,
-      };
-
-  Future<void> _writeJsonAtomic(File file, Map<String, dynamic> data) async {
-    final tmp = File('${file.path}.tmp');
-    await tmp.writeAsString(jsonEncode(data));
-    if (await file.exists()) {
-      await file.delete();
+  Future<void> _handleStartFailure(Object error, StackTrace stackTrace) async {
+    _errCtl.add(error);
+    if (kDebugMode) {
+      debugPrint('LivePoseEngine.start error: $error\n$stackTrace');
     }
-    await tmp.rename(file.path);
+    await _jsonlSink?.flush();
+    await _jsonlSink?.close();
+    _jsonlSink = null;
+    if (_activeSession != null) {
+      try {
+        if (await _activeSession!.dir.exists()) {
+          await _activeSession!.dir.delete(recursive: true);
+        }
+      } catch (_) {}
+    }
+    _activeSession = null;
+    _setState(ProcessingState.error);
   }
 
-  Future<void> _deleteDir(Directory dir) async {
-    if (await dir.exists()) {
-      await dir.delete(recursive: true);
+  Future<void> _teardownSession() async {
+    if (_jsonlSink != null) {
+      await _jsonlSink!.flush();
+      await _jsonlSink!.close();
     }
+    _jsonlSink = null;
+    _activeSession = null;
+  }
+
+  void _ensureNotDisposed() {
+    if (_disposed) {
+      throw StateError('PoseProcessingController has been disposed');
+    }
+  }
+
+  List<String> _defaultProviders() {
+    if (kIsWeb) return const ['cpu'];
+    if (Platform.isAndroid) {
+      return const ['nnapi', 'xnnpack', 'cpu'];
+    }
+    if (Platform.isIOS) {
+      return const ['coreml', 'cpu'];
+    }
+    return const ['cpu'];
   }
 }
 
-SessionId generateSessionId() {
+/// Helper that executes the MotionBERT model (placeholder implementation).
+class MotionBertRunner {
+  const MotionBertRunner();
+
+  Future<ProcessingResult> run({
+    required String jsonl2dPath,
+    required Directory sessionDir,
+    required List<String> providers,
+  }) async {
+    return Isolate.run<ProcessingResult>(() async {
+      final jsonlFile = File(jsonl2dPath);
+      if (!await jsonlFile.exists()) {
+        throw StateError('Missing 2D JSONL at $jsonl2dPath');
+      }
+
+      final lines = await jsonlFile.readAsLines();
+      final outPath = p.join(sessionDir.path, 'out_3d.json');
+
+      final payload = <String, Object?>{
+        'generatedAt': DateTime.now().toUtc().toIso8601String(),
+        'providers': providers,
+        'frameCount': lines.length,
+        'note': 'Placeholder MotionBERT output',
+      };
+
+      final outFile = File(outPath);
+      await outFile.create(recursive: true);
+      await outFile.writeAsString('${jsonEncode(payload)}\n');
+
+      return ProcessingResult(
+        jsonl2dPath: jsonl2dPath,
+        out3dPath: outFile.path,
+        reportPaths: const <String>[],
+      );
+    });
+  }
+}
+
+/// Minimal interface required from the live engine implementation.
+abstract class LivePoseEngine {
+  Stream<Object> get errors;
+
+  Future<void> start({
+    required SessionInfo session,
+    required IOSink jsonlSink,
+    required int frameStride,
+  });
+
+  Future<void> stop();
+
+  Future<void> dispose();
+}
+
+String generateSessionId() {
   final now = DateTime.now().toUtc();
   final base = now.toIso8601String().replaceAll(':', '-').replaceAll('.', '-');
   final rand = Random().nextInt(0xFFFFFF).toRadixString(16).padLeft(6, '0');
