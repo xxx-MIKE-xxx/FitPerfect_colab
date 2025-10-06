@@ -20,10 +20,8 @@ import 'dart:math';
 import 'dart:ui' show Size;
 
 import 'package:flutter/foundation.dart';
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
-
 import 'motionbert_runner.dart';
+import 'storage_layout.dart';
 
 typedef SessionId = String;
 
@@ -160,15 +158,17 @@ class PoseProcessingController extends ChangeNotifier {
     _progressCtrl.add(ProgressEvent.indeterminate(phase: 'Preparing MotionBERT'));
 
     try {
-      // Log where we expect 2D to be (primary & legacy) for quick diagnosis.
-      final paths = await _expected2DPaths(sessionId);
+      final primary = await StorageLayout.out2dFile(sessionId);
+      final shadow = await StorageLayout.cocoShadowFile(sessionId);
+      final legacy = await StorageLayout.legacyFramesJsonl(sessionId);
       debugPrint('[PoseProcessingController] 2D lookup: '
-          'primary="${paths.primary}", legacy="${paths.legacy}"');
+          'primary="${primary.path}", shadow="${shadow.path}", legacy="${legacy.path}"');
 
-      final primaryExists = await File(paths.primary).exists();
-      final legacyExists = await File(paths.legacy).exists();
+      final primaryExists = await primary.exists();
+      final shadowExists = await shadow.exists();
+      final legacyExists = await legacy.exists();
       debugPrint('[PoseProcessingController] 2D presence: '
-          'primary=$primaryExists, legacy=$legacyExists');
+          'primary=$primaryExists, shadow=$shadowExists, legacy=$legacyExists');
 
       _progressCtrl.add(
         ProgressEvent.indeterminate(phase: 'Running MotionBERT'),
@@ -228,22 +228,6 @@ class PoseProcessingController extends ChangeNotifier {
 
   // ───────────────────────────── helpers ─────────────────────────────
 
-  /// Compute the expected 2D file paths for a given session.
-  ///  - primary: Documents/FitPerfect/<sessionId>/coco_2d.jsonl
-  ///  - legacy : Documents/FitPerfect/poses/<sessionId>/2d/frames.jsonl
-  Future<_Expected2DPaths> _expected2DPaths(SessionId sessionId) async {
-    final docs = await getApplicationDocumentsDirectory();
-    final base = p.join(docs.path, 'FitPerfect');
-    final primary = p.join(base, sessionId, 'coco_2d.jsonl');
-    final legacy = p.join(base, 'poses', sessionId, '2d', 'frames.jsonl');
-    return _Expected2DPaths(primary: primary, legacy: legacy);
-  }
-}
-
-class _Expected2DPaths {
-  const _Expected2DPaths({required this.primary, required this.legacy});
-  final String primary;
-  final String legacy;
 }
 
 /// Legacy helper used by some screens to generate unique session ids.

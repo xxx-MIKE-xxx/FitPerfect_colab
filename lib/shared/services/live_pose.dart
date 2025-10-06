@@ -3,16 +3,21 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+
 import 'package:camera/camera.dart';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 import 'package:onnxruntime/onnxruntime.dart';
-import 'package:path_provider/path_provider.dart';
 
+import 'log.dart';
 import 'ort_session.dart';
+import 'storage_layout.dart';
 import 'tensor_utils.dart';
 import 'yuv_converter.dart';
+
+enum ProcessingMode { liveInMemory, recordThenProcess }
 
 class LivePoseEngine {
   LivePoseEngine({this.yoloEvery = 5, this.roiMargin = 1.25});
@@ -21,14 +26,24 @@ class LivePoseEngine {
   String? _sessionId;
   Directory? _sessionDir;
   IOSink? _jsonlSink;
-  String? _jsonlPath;
-  int _t = 0;
+  File? _jsonlTmpFile;
+  File? _jsonlFinalFile;
+  File? _shadow2dFile;
+  IOSink? _yoloDecodeSink;
+  ProcessingMode _processingMode = ProcessingMode.liveInMemory;
+  int _framesWritten = 0;
+  DateTime? _startedAt;
+  int _lastImgW = 0;
+  int _lastImgH = 0;
+  final _ConfidenceStats _confStats = _ConfidenceStats();
 
   final int yoloEvery;     // refresh detection every N frames
   final double roiMargin;  // crop expansion
 
   OrtSession? _yolo;
   OrtSession? _rtm;
+
+  Map<String, double>? _lbParams; // last letterbox parameters for logging/index
 
   Float32List? _yoloInputChw; // reusable buffer for YOLO input (1×3×640×640)
   Float32List? _rtmInputChw;  // reusable buffer for RTMPose input (1×3×256×192)
@@ -43,37 +58,82 @@ class LivePoseEngine {
     _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
     _rtm  ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
   }
-  /// Open the JSONL writer at Documents/FitPerfect/<sessionId>/coco_2d.jsonl
-  Future<void> start({required CameraController controller, required String sessionId, bool writeToDocuments = true}) async {
+  ProcessingMode get processingMode => _processingMode;
+
+  /// Open the JSONL writer at Documents/FitPerfect/<sessionId>/out_2d.jsonl
+  Future<void> start({
+    required CameraController controller,
+    required String sessionId,
+    String? exerciseId,
+    Size? frameSize,
+  }) async {
+    await _ensureModelsLoaded();
     _sessionId = sessionId;
-    final Directory baseDir = writeToDocuments
-        ? await getApplicationDocumentsDirectory()
-        : await getTemporaryDirectory();
-    _sessionDir = Directory('${baseDir.path}/FitPerfect/$_sessionId');
-    if (!(await _sessionDir!.exists())) {
-      await _sessionDir!.create(recursive: true);
-    }
-    _jsonlPath = '${_sessionDir!.path}/coco_2d.jsonl';
-    _jsonlSink = File(_jsonlPath!).openWrite(mode: FileMode.writeOnlyAppend);
-    _t = 0;
+    _sessionDir = await StorageLayout.sessionDir(sessionId);
+
+    _processingMode = await _decideProcessingMode();
+    _jsonlFinalFile = await StorageLayout.out2dFile(sessionId);
+    _jsonlTmpFile = File('${_jsonlFinalFile!.path}.tmp');
+    _shadow2dFile = await StorageLayout.cocoShadowFile(sessionId);
+    _jsonlSink = _jsonlTmpFile!.openWrite(mode: FileMode.write);
+    _yoloDecodeSink = (await StorageLayout.yoloDecodeLog(sessionId)).openWrite(mode: FileMode.write);
+
+    _framesWritten = 0;
+    _startedAt = DateTime.now();
+    _lastImgW = 0;
+    _lastImgH = 0;
+    _confStats.reset();
+    _lbParams = null;
+
+    await _writeMetaSeed(exerciseId: exerciseId, frameSize: frameSize);
+    Log.i('LivePose', 'start session=$sessionId mode=${_processingMode.name}');
   }
 
   /// Flush and close the JSONL file. Returns the sessionId.
   Future<String?> stop({required CameraController controller}) async {
+    final sid = _sessionId;
+    if (sid == null) return null;
     try {
       await _jsonlSink?.flush();
       await _jsonlSink?.close();
+      await _yoloDecodeSink?.flush();
+      await _yoloDecodeSink?.close();
+
+      if (_jsonlTmpFile != null && _jsonlFinalFile != null) {
+        if (await _jsonlTmpFile!.exists()) {
+          await _jsonlTmpFile!.rename(_jsonlFinalFile!.path);
+        }
+        if (_shadow2dFile != null) {
+          try {
+            await _jsonlFinalFile!.copy(_shadow2dFile!.path);
+          } catch (e) {
+            Log.w('LivePose', 'shadow copy failed: $e');
+          }
+        }
+      }
+
+      await _write2dIndex(sid);
+      await _updateMetaOnStop(sid);
+
+      final size = await _jsonlFinalFile?.exists() == true
+          ? await _jsonlFinalFile!.length()
+          : 0;
+      Log.i('LivePose', 'CLOSE wrote $_framesWritten frames → '
+          '${_jsonlFinalFile?.path} (size=$size bytes)');
     } finally {
-      final sid = _sessionId;
       _jsonlSink = null;
+      _yoloDecodeSink = null;
+      _jsonlTmpFile = null;
+      _jsonlFinalFile = null;
+      _shadow2dFile = null;
       _sessionId = null;
-      return sid;
     }
+    return sid;
   }
 
 
   /// Main entry: returns 17 keypoints in **raw camera space** (width×height).
-  Future<List<Offset>?> estimate2D(CameraImage cam) async {
+  Future<List<Offset>?> processFrame(CameraImage cam) async {
     await _ensureModelsLoaded();
     // 1) YUV → RGB
     final rgb = yuv420ToImage(cam); // width=cam.width, height=cam.height
@@ -526,6 +586,90 @@ class LivePoseEngine {
     return _Det(x1, y1, x2, y2, d.score);
   }
 
+  Future<ProcessingMode> _decideProcessingMode() async {
+    try {
+      final rssMb = ProcessInfo.currentRss / (1024 * 1024);
+      Log.i('LivePose', 'memory probe rss=${rssMb.toStringAsFixed(1)}MB');
+    } catch (e) {
+      Log.w('LivePose', 'memory probe failed: $e');
+    }
+    // Until a full RAM probe is wired, prefer live mode (current behaviour).
+    return ProcessingMode.liveInMemory;
+  }
+
+  Future<void> _writeMetaSeed({String? exerciseId, Size? frameSize}) async {
+    final sid = _sessionId;
+    if (sid == null) return;
+    final file = await StorageLayout.metaFile(sid);
+    Map<String, dynamic> meta = {};
+    if (await file.exists()) {
+      try {
+        meta = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+
+    meta['sessionId'] = sid;
+    meta['exerciseId'] = exerciseId ?? meta['exerciseId'];
+    meta['startedAt'] = (_startedAt ?? DateTime.now())
+        .toUtc()
+        .toIso8601String();
+    meta['processingMode'] = _processingMode.name;
+    meta['models'] = {
+      'yolo': 'yolov8n.onnx',
+      'rtm': 'rtmpose-m_256x192.onnx',
+    };
+    if (frameSize != null) {
+      meta['frameSize'] = {
+        'width': frameSize.width,
+        'height': frameSize.height,
+      };
+    }
+
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(meta));
+  }
+
+  Future<void> _write2dIndex(String sessionId) async {
+    final file = await StorageLayout.out2dIndexFile(sessionId);
+    final elapsed = _startedAt != null
+        ? DateTime.now().difference(_startedAt!).inMilliseconds / 1000.0
+        : 0.0;
+    final fps = elapsed > 0 ? _framesWritten / elapsed : 0.0;
+    final summary = {
+      'sessionId': sessionId,
+      'T': _framesWritten,
+      'fps': double.parse(fps.toStringAsFixed(3)),
+      'imgW': _lastImgW,
+      'imgH': _lastImgH,
+      'confidence': _confStats.toSummary(),
+      'processingMode': _processingMode.name,
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+      if (_lbParams != null) 'letterbox': _lbParams,
+    };
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(summary));
+  }
+
+  Future<void> _updateMetaOnStop(String sessionId) async {
+    final file = await StorageLayout.metaFile(sessionId);
+    Map<String, dynamic> meta = {};
+    if (await file.exists()) {
+      try {
+        meta = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+    final elapsed = _startedAt != null
+        ? DateTime.now().difference(_startedAt!).inMilliseconds / 1000.0
+        : null;
+    meta['processingMode'] = _processingMode.name;
+    meta['frames2d'] = _framesWritten;
+    if (elapsed != null) {
+      meta['duration2dSec'] = elapsed;
+    }
+    meta['imgW'] = _lastImgW;
+    meta['imgH'] = _lastImgH;
+    meta['updatedAt'] = DateTime.now().toUtc().toIso8601String();
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(meta));
+  }
+
   void _appendJsonl({
     required List<List<double>> kptsRaw, // [17][3] in raw px
     required _Det bboxRaw,               // raw px
@@ -534,24 +678,55 @@ class LivePoseEngine {
     required _LetterboxMeta lb,
   }) {
     if (_jsonlSink == null) return;
+    final elapsed = _startedAt != null
+        ? DateTime.now().difference(_startedAt!).inMilliseconds / 1000.0
+        : 0.0;
     final bboxNorm = [
-      bboxRaw.x1 / rawW, bboxRaw.y1 / rawH,
-      bboxRaw.x2 / rawW, bboxRaw.y2 / rawH,
-    ];
-    final line = {
-      "t": _t++,
-      "bbox": bboxNorm,
-      "score": bboxRaw.score,
-      "kpt_coco": kptsRaw,
-      "yolo_output_units": "px",
-      "yolo_output_coords": "raw",
-      "lb_scale": lb.scale,
-      "lb_padX": lb.padX,
-      "lb_padY": lb.padY,
-      "raw_w": rawW,
-      "raw_h": rawH,
+      bboxRaw.x1 / rawW,
+      bboxRaw.y1 / rawH,
+      bboxRaw.x2 / rawW,
+      bboxRaw.y2 / rawH,
+    ].map((e) => double.parse(e.toStringAsFixed(6))).toList();
+    final frame = {
+      't': double.parse(elapsed.toStringAsFixed(3)),
+      'img_w': rawW,
+      'img_h': rawH,
+      'bbox': bboxNorm,
+      'kpt': kptsRaw
+          .map((kp) => kp.map((v) => double.parse(v.toStringAsFixed(5))).toList())
+          .toList(),
+      'lb': {
+        'scale': lb.scale,
+        'pad_x': lb.padX,
+        'pad_y': lb.padY,
+      },
+      'model': {
+        'yolo': 'yolov8n.onnx',
+        'rtm': 'rtmpose-m_256x192.onnx',
+      },
+      'score': double.parse(bboxRaw.score.toStringAsFixed(3)),
     };
-    _jsonlSink!.writeln(jsonEncode(line));
+
+    _lbParams = {
+      'scale': lb.scale,
+      'pad_x': lb.padX,
+      'pad_y': lb.padY,
+    };
+
+    _jsonlSink!.writeln(jsonEncode(frame));
+    _framesWritten++;
+    _lastImgW = rawW;
+    _lastImgH = rawH;
+    _confStats.addFrame(kptsRaw);
+
+    if (_yoloDecodeSink != null && _framesWritten % 30 == 0) {
+      final tVal = frame['t'];
+      final scoreVal = frame['score'];
+      _yoloDecodeSink!.writeln(
+        '[frame=$_framesWritten] t=$tVal bbox=${bboxNorm.map((v) => v.toStringAsFixed(3)).join(',')} '
+        'score=$scoreVal',
+      );
+    }
   }
 
   Float32List _toFloat32(dynamic v) {
@@ -577,32 +752,96 @@ class LivePoseEngine {
 }
 
 // ───────── data holders ─────────
-class _Det { _Det(this.x1, this.y1, this.x2, this.y2, this.score);
-  final double x1, y1, x2, y2, score; }
+class _Det {
+  _Det(this.x1, this.y1, this.x2, this.y2, this.score);
+
+  final double x1;
+  final double y1;
+  final double x2;
+  final double y2;
+  final double score;
+}
 
 class _CropMeta {
   _CropMeta({
-    required this.roiX, required this.roiY,
-    required this.roiW, required this.roiH,
-    required this.outW, required this.outH,
+    required this.roiX,
+    required this.roiY,
+    required this.roiW,
+    required this.roiH,
+    required this.outW,
+    required this.outH,
   });
-  final double roiX, roiY, roiW, roiH;
-  final int outW, outH;
+
+  final double roiX;
+  final double roiY;
+  final double roiW;
+  final double roiH;
+  final int outW;
+  final int outH;
 }
 
-class _CropResult { _CropResult(this.image, this.meta);
-  final img.Image image; final _CropMeta meta; }
+class _CropResult {
+  _CropResult(this.image, this.meta);
+
+  final img.Image image;
+  final _CropMeta meta;
+}
 
 class _LetterboxMeta {
   _LetterboxMeta({
-    required this.srcW, required this.srcH,
-    required this.scale, required this.padX, required this.padY,
+    required this.srcW,
+    required this.srcH,
+    required this.scale,
+    required this.padX,
+    required this.padY,
   });
-  final int srcW, srcH;
-  final double scale, padX, padY;
+
+  final int srcW;
+  final int srcH;
+  final double scale;
+  final double padX;
+  final double padY;
 }
+
 class _LetterboxResult {
   _LetterboxResult({required this.square, required this.meta});
+
   final img.Image square;
   final _LetterboxMeta meta;
+}
+
+class _ConfidenceStats {
+  double _sum = 0.0;
+  double _min = double.infinity;
+  double _max = 0.0;
+  int _count = 0;
+
+  void reset() {
+    _sum = 0.0;
+    _min = double.infinity;
+    _max = 0.0;
+    _count = 0;
+  }
+
+  void addFrame(List<List<double>> joints) {
+    for (final joint in joints) {
+      if (joint.length < 3) continue;
+      final conf = joint[2];
+      _sum += conf;
+      _min = math.min(_min, conf);
+      _max = math.max(_max, conf);
+      _count++;
+    }
+  }
+
+  Map<String, double> toSummary() {
+    if (_count == 0) {
+      return {'mean': 0.0, 'min': 0.0, 'max': 0.0};
+    }
+    return {
+      'mean': _sum / _count,
+      'min': _min.isFinite ? _min : 0.0,
+      'max': _max,
+    };
+  }
 }

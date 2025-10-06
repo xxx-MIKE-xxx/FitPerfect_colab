@@ -34,6 +34,12 @@ class OrtManager {
     final Uint8List bytes =
         data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
 
+    try {
+      OrtEnv.instance.loggingSeverityLevel = OrtLoggingLevel.warning;
+    } catch (_) {
+      // Older plugin versions may not expose logging severity setters.
+    }
+
     final options = OrtSessionOptions();
 
     // Threads + graph opts

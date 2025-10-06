@@ -29,6 +29,9 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
+import 'package:share_plus/share_plus.dart';
+
+import '../shared/services/storage_layout.dart';
 
 class FeedbackSummaryScreen extends StatefulWidget {
   const FeedbackSummaryScreen({
@@ -103,6 +106,49 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
       if (mounted) {
         setState(() {
           _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _shareSessionFiles() async {
+    final sessionId = widget.sessionId;
+    if (sessionId == null) {
+      setState(() {
+        _error = 'Session ID missing – nothing to share.';
+      });
+      return;
+    }
+
+    try {
+      final files = <XFile>[];
+      final out2d = await StorageLayout.out2dFile(sessionId);
+      if (await out2d.exists()) {
+        files.add(XFile(out2d.path));
+      }
+      final out3d = await StorageLayout.out3dFile(sessionId);
+      if (await out3d.exists()) {
+        files.add(XFile(out3d.path));
+      }
+      final meta = await StorageLayout.metaFile(sessionId);
+      if (await meta.exists()) {
+        files.add(XFile(meta.path));
+      }
+      if (files.isEmpty) {
+        setState(() {
+          _error = 'No session files found to share.';
+        });
+        return;
+      }
+      await Share.shareXFiles(
+        files,
+        subject: 'FitPerfect session $sessionId',
+        text: 'Session files for $sessionId',
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = 'Share failed: $e';
         });
       }
     }
@@ -190,6 +236,13 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Feedback Summary'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.ios_share),
+            tooltip: 'Share session files',
+            onPressed: widget.sessionId == null ? null : _shareSessionFiles,
+          ),
+        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
@@ -273,6 +326,8 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
             ),
           ],
         ),
+        const SizedBox(height: 16),
+        _buildFileInfoCard(),
       ],
     );
   }
@@ -329,6 +384,66 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
     );
   }
 
+  Widget _buildFileInfoCard() {
+    final sessionId = widget.sessionId;
+    if (sessionId == null) {
+      return const SizedBox.shrink();
+    }
+    return FutureBuilder<List<_SessionFileInfo>>(
+      future: _collectFileInfo(sessionId),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const SizedBox.shrink();
+        }
+        final files = snapshot.data ?? const <_SessionFileInfo>[];
+        if (files.isEmpty) {
+          return const SizedBox.shrink();
+        }
+        return Card(
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: files
+                .map((info) => ListTile(
+                      leading: const Icon(Icons.article_outlined),
+                      title: Text(info.name),
+                      subtitle: Text(p.basename(info.path)),
+                      trailing: Text(
+                        '${(info.size / 1024).toStringAsFixed(1)} KB\n${info.modified.toLocal().toIso8601String()}',
+                        textAlign: TextAlign.end,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ))
+                .toList(),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<List<_SessionFileInfo>> _collectFileInfo(String sessionId) async {
+    final targets = <String, Future<File>>{
+      'out_2d.jsonl': StorageLayout.out2dFile(sessionId),
+      'out_2d_index.json': StorageLayout.out2dIndexFile(sessionId),
+      'out_3d.json': StorageLayout.out3dFile(sessionId),
+      'out_3d_index.json': StorageLayout.out3dIndexFile(sessionId),
+      'meta.json': StorageLayout.metaFile(sessionId),
+    };
+    final result = <_SessionFileInfo>[];
+    for (final entry in targets.entries) {
+      final file = await entry.value;
+      if (await file.exists()) {
+        final stat = await file.stat();
+        result.add(_SessionFileInfo(
+          name: entry.key,
+          path: file.path,
+          size: stat.size,
+          modified: stat.modified,
+        ));
+      }
+    }
+    return result;
+  }
+
   Widget _errorCard(String error) {
     return Card(
       color: Theme.of(context).colorScheme.errorContainer,
@@ -371,4 +486,18 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
       ),
     );
   }
+}
+
+class _SessionFileInfo {
+  _SessionFileInfo({
+    required this.name,
+    required this.path,
+    required this.size,
+    required this.modified,
+  });
+
+  final String name;
+  final String path;
+  final int size;
+  final DateTime modified;
 }
