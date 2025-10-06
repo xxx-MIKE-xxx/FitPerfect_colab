@@ -818,9 +818,13 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     _logPoseEvents = false;
     _cam.dispose();
     _processingSub?.cancel();
-    unawaited(_processingController.dispose());
+
+    // was: unawaited(_processingController.dispose());
+    _processingController.dispose();
+
     super.dispose();
   }
+
 
   /* ───────────────────── UI ───────────────────── */
   @override
@@ -1211,22 +1215,35 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     );
 
     try {
-      final outcome = await _processingController.processRecording(
-        videoFile: videoFile,
-        meta: meta,
-      );
-      final report = outcome.toFeedbackReport();
+      // We already have meta (with the sessionId and frame size).
+      final sessionId = meta.sessionId;
+      final frameSize = Size(meta.width.toDouble(), meta.height.toDouble());
+
+      // Run only the MotionBERT step (Option B).
+      final file3d = await _processingController.run3DForSession(sessionId, frameSize);
+      final out3dPath = file3d?.path;
+
+      // Minimal report payload. Your SummaryRepository can enrich/derive if needed.
+      final report = {
+        'sessionId': sessionId,
+        'fps': meta.fps,
+        'exercise': meta.exercise,
+        'out3dPath': out3dPath, // may be null on failure; Feedback can handle it
+      };
+
       if (!mounted) return;
       await _navigateToFeedback(
         videoFile.path,
-        'local/${widget.exerciseId}/${outcome.sessionId}.mp4',
+        'local/${widget.exerciseId}/$sessionId.mp4',
         report,
       );
+
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('🎯 3D pose analysis ready!')),
       );
-    } on PoseProcessingCancelled {
+    }
+    on PoseProcessingCancelled {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('3D processing cancelled.')),
