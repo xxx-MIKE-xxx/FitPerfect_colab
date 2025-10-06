@@ -103,23 +103,35 @@ final router = GoRouter(
           path: '/feedback',
           builder: (ctx, state) {
             final extra = (state.extra as Map<String, dynamic>?) ?? const {};
+            final args = (state.extra is Map<String, dynamic>)
+                ? state.extra as Map<String, dynamic>
+                : const <String, dynamic>{};
+
             return FeedbackScreen(
-              videoPath: extra['videoPath'] as String?,
-              videoKey : extra['videoKey']  as String?,
-              report   : (extra['report'] as Map<String, dynamic>?)
-                        ?? const {'data': []}, // empty = no overlays
+              exerciseId: args['exerciseId'] ?? 'unknown',
+              sessionId : args['sessionId'],                 // optional
+              out3dPath : args['out3dPath'] ?? args['videoPath'], // ✅ renamed; keep legacy key as fallback
+              report    : args['report'] as Map<String, dynamic>?,
+              s3Key     : args['s3Key'] as String?,
             );
+
           },
         ),
         GoRoute(
           path: '/feedback-summary',
           builder: (ctx, state) {
-            final extra = (state.extra as Map<String, dynamic>?) ?? const {};
-            return FeedbackSummaryScreen(
-              exerciseId : extra['exerciseId'] as String,
-              s3Key      : extra['s3Key'] as String?,
-              localReport: extra['report'] as Map<String, dynamic>?,
-            );
+            final args = (state.extra is Map<String, dynamic>)
+              ? state.extra as Map<String, dynamic>
+              : const <String, dynamic>{};
+
+          return FeedbackSummaryScreen(
+            exerciseId: args['exerciseId'] ?? 'unknown',
+            sessionId : args['sessionId'],
+            out3dPath : args['out3dPath'] ?? args['videoPath'], // ✅
+            report    : args['report'] as Map<String, dynamic>?,
+            s3Key     : args['s3Key'] as String?,
+          );
+
           },
         ),
 
