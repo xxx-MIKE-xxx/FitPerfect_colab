@@ -325,8 +325,8 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     if (sid == null) return;
     try {
       final docs = await getApplicationDocumentsDirectory();
-      final dir = Directory('\${docs.path}/FitPerfect/\$sid');
-      final file = File('\${dir.path}/coco_2d.jsonl');
+      final dir = Directory('${docs.path}/FitPerfect/$sid');
+      final file = File('${dir.path}/coco_2d.jsonl');
       if (!file.existsSync()) {
         setState(() => _logTail = const ['(no coco_2d.jsonl found yet)']);
         return;
@@ -378,8 +378,8 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     setState(() { _retrying3D = true; _mbError = null; });
     try {
       final docs = await getApplicationDocumentsDirectory();
-      final dir = Directory('\${docs.path}/FitPerfect/\$sid');
-      final file = File('\${dir.path}/coco_2d.jsonl');
+      final dir = Directory('${docs.path}/FitPerfect/$sid');
+      final file = File('${dir.path}/coco_2d.jsonl');
       if (!file.existsSync()) throw 'coco_2d.jsonl missing in \$sid';
       final lines = await file.readAsLines();
       int w = 640, h = 480;
