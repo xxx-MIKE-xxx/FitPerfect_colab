@@ -25,10 +25,10 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Size;
 
-import 'package:path_provider/path_provider.dart';
-
 import 'ort_session.dart'; // OrtManager.fromAsset(...)
 import 'pipeline_debug_recorder.dart';
+import 'storage_layout.dart';
+import 'log.dart';
 
 class MotionBertRunner {
   MotionBertRunner({
@@ -49,16 +49,7 @@ class MotionBertRunner {
     bool rootRelative = true,
     bool writeNpy = false,
   }) async {
-    // Resolve session directory (Documents first, then Temp fallback).
-    final Directory docs = await getApplicationDocumentsDirectory();
-    final Directory temp = await getTemporaryDirectory();
-    final dirDocs = Directory('${docs.path}/FitPerfect/$sessionId');
-    final dirTemp = Directory('${temp.path}/FitPerfect/$sessionId');
-    final Directory sessionDir =
-        await dirDocs.exists() ? dirDocs : (await dirTemp.exists() ? dirTemp : dirDocs);
-    if (!(await sessionDir.exists())) {
-      await sessionDir.create(recursive: true);
-    }
+    final Directory sessionDir = await StorageLayout.sessionDir(sessionId);
 
     final PipelineDebugRecorder? dbg = debug
         ? PipelineDebugRecorder(
@@ -74,27 +65,24 @@ class MotionBertRunner {
       'model': modelAssetPath,
     });
 
-    
-    // Robust 2D lookup: try primary then legacy path
-    final File primary2D = File('${sessionDir.path}/coco_2d.jsonl');
-    final File legacy2D  = File('${docs.path}/FitPerfect/poses/$sessionId/2d/frames.jsonl');
+    final File primary2D = await StorageLayout.out2dFile(sessionId);
+    final File shadow2D = await StorageLayout.cocoShadowFile(sessionId);
+    final File legacy2D = await StorageLayout.legacyFramesJsonl(sessionId);
+
     dbg?.log('MB_2D_LOOKUP', {
       'primary': primary2D.path,
-      'legacy' : legacy2D.path,
+      'shadow': shadow2D.path,
+      'legacy': legacy2D.path,
     });
-    final File file2D = await primary2D.exists()
-        ? primary2D
-        : (await legacy2D.exists() ? legacy2D : primary2D);
-    if (!await file2D.exists()) {
-      // Log both attempted paths before throwing
-      final msg = 'Missing 2D keypoints: tried primary=${primary2D.path} and legacy=${legacy2D.path}';
-      dbg?.log('MB_2D_LOOKUP_FAIL', {'message': msg});
-      throw StateError(msg);
-    }
 
-    if (!await file2D.exists()) {
-      throw StateError('Missing coco_2d.jsonl at ${file2D.path}');
-    }
+    final File file2D = await _resolve2dFile(
+      primary: primary2D,
+      shadow: shadow2D,
+      legacy: legacy2D,
+    );
+
+    dbg?.log('MB_2D_SELECTED', {'path': file2D.path});
+    Log.i('MotionBERT', 'reading 2D from ${file2D.path}');
 
     try {
       // --- 1) Read COCO-17 sequence from jsonl
@@ -104,8 +92,12 @@ class MotionBertRunner {
           .transform(const LineSplitter())) {
         if (line.trim().isEmpty) continue;
         final obj = json.decode(line) as Map<String, dynamic>;
-        final kpts = (obj['kpt_coco'] as List)
-            .map<List<double>>((e) => (e as List).map((v) => (v as num).toDouble()).toList())
+        final raw = obj['kpt'] ?? obj['kpt_coco'];
+        if (raw is! List) continue;
+        final kpts = raw
+            .map<List<double>>((e) => (e as List)
+                .map((v) => (v as num?)?.toDouble() ?? 0.0)
+                .toList())
             .toList();
         if (kpts.length == 17) {
           seqCoco.add(kpts);
@@ -144,11 +136,12 @@ class MotionBertRunner {
       final double s = (math.min(W, H) / 2.0);
       final double cx = W / 2.0;
       final double cy = H / 2.0;
+      const stride = 81;
       dbg?.log('MB_PREP', {
         'sessionId': sessionId,
         'frames': seqCoco.length,
         'window': T,
-        'stride': 81,
+        'stride': stride,
         'normalize': {
           'center': [cx, cy],
           'scale': s,
@@ -239,7 +232,7 @@ class MotionBertRunner {
         final stats = {
           'frames_2d': seqCoco.length,
           'window': T,
-          'stride': 81,
+          'stride': stride,
           'z_min': zMin,
           'z_max': zMax,
         };
@@ -273,8 +266,31 @@ class MotionBertRunner {
         ],
         "coords_3d": X3D,
       };
-      final outFile = File('${sessionDir.path}/out_3d.json');
-      await outFile.writeAsString(const JsonEncoder.withIndent('  ').convert(outJson));
+      final outFile = await StorageLayout.out3dFile(sessionId);
+      final tmp = File('${outFile.path}.tmp');
+      await tmp.writeAsString(const JsonEncoder.withIndent('  ').convert(outJson));
+      if (await outFile.exists()) {
+        await outFile.delete();
+      }
+      await tmp.rename(outFile.path);
+      await _write3dIndex(
+        sessionId: sessionId,
+        frames: T,
+        stride: stride,
+        rootRelative: rootRelative,
+        zMin: zMin,
+        zMax: zMax,
+      );
+      await _updateMetaAfter3d(
+        sessionId: sessionId,
+        frames: T,
+        stride: stride,
+        rootRelative: rootRelative,
+        zMin: zMin,
+        zMax: zMax,
+      );
+      final outSize = await outFile.length();
+      Log.i('MotionBERT', '3D analysis ready (sessionId=$sessionId, out3d=$outSize bytes)');
       dbg?.log('MB_OUT_FILE', {
         'sessionId': sessionId,
         'path': outFile.path,
@@ -283,6 +299,88 @@ class MotionBertRunner {
     } finally {
       await dbg?.close();
     }
+  }
+
+  Future<File> _resolve2dFile({
+    required File primary,
+    required File shadow,
+    required File legacy,
+  }) async {
+    const attempts = 10;
+    for (int i = 0; i < attempts; i++) {
+      if (await primary.exists()) {
+        return primary;
+      }
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+
+    if (await shadow.exists()) {
+      Log.w('MotionBERT', 'using shadow 2D file at ${shadow.path}');
+      return shadow;
+    }
+
+    if (await legacy.exists()) {
+      Log.w('MotionBERT', 'using legacy 2D file at ${legacy.path}');
+      return legacy;
+    }
+
+    final msg = 'Missing 2D keypoints: tried ${primary.path}, ${shadow.path}, ${legacy.path}';
+    Log.e('MotionBERT', msg);
+    throw StateError(msg);
+  }
+
+  Future<void> _write3dIndex({
+    required String sessionId,
+    required int frames,
+    required int stride,
+    required bool rootRelative,
+    required double zMin,
+    required double zMax,
+  }) async {
+    final file = await StorageLayout.out3dIndexFile(sessionId);
+    final tmp = File('${file.path}.tmp');
+    final summary = {
+      'T': frames,
+      'window': 243,
+      'stride': stride,
+      'pelvisCentered': rootRelative,
+      'z_min': double.parse(zMin.toStringAsFixed(4)),
+      'z_max': double.parse(zMax.toStringAsFixed(4)),
+      'updatedAt': DateTime.now().toUtc().toIso8601String(),
+    };
+    await tmp.writeAsString(const JsonEncoder.withIndent('  ').convert(summary));
+    if (await file.exists()) {
+      await file.delete();
+    }
+    await tmp.rename(file.path);
+  }
+
+  Future<void> _updateMetaAfter3d({
+    required String sessionId,
+    required int frames,
+    required int stride,
+    required bool rootRelative,
+    required double zMin,
+    required double zMax,
+  }) async {
+    final metaFile = await StorageLayout.metaFile(sessionId);
+    Map<String, dynamic> meta = {};
+    if (await metaFile.exists()) {
+      try {
+        meta = jsonDecode(await metaFile.readAsString()) as Map<String, dynamic>;
+      } catch (_) {}
+    }
+    meta['frames3d'] = frames;
+    meta['motionbert'] = {
+      'model': modelAssetPath,
+      'window': 243,
+      'stride': stride,
+      'pelvisCentered': rootRelative,
+      'z_min': double.parse(zMin.toStringAsFixed(4)),
+      'z_max': double.parse(zMax.toStringAsFixed(4)),
+      'completedAt': DateTime.now().toUtc().toIso8601String(),
+    };
+    await metaFile.writeAsString(const JsonEncoder.withIndent('  ').convert(meta));
   }
 
   // ---------- helpers ----------

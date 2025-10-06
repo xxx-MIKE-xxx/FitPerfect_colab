@@ -281,7 +281,16 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
           if (!_engineStarted) {
             _sessionId = generateSessionId();
             try {
-              await _engine.start(controller: _cam, sessionId: _sessionId!);
+              final preview = _cam.value.previewSize;
+              final frameSize = preview == null
+                  ? null
+                  : Size(preview.height, preview.width);
+              await _engine.start(
+                controller: _cam,
+                sessionId: _sessionId!,
+                exerciseId: widget.exerciseId,
+                frameSize: frameSize,
+              );
               _engineStarted = true;
             } catch (e) {
               if (kDebugMode) {
@@ -310,7 +319,7 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     if (_runningEst) return;
     _runningEst = true;
     try {
-      final pts = await _engine.estimate2D(img); // Offsets in raw camera space
+      final pts = await _engine.processFrame(img); // Offsets in raw camera space
 
       // Log for export (if we have points)
       if (pts != null) {
@@ -1041,6 +1050,11 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       fit: StackFit.expand,
       children: [
         CameraPreview(_cam),
+        Positioned(
+          top: topPadding + 12,
+          left: 16,
+          child: _ProcessingModeChip(mode: _engine.processingMode),
+        ),
         if (showLiveSkeleton)
           AnimatedBuilder(
             animation: _skeletonAnimation,
@@ -1673,5 +1687,42 @@ class _ReferenceSkeletonOutlinePainter extends CustomPainter {
         oldDelegate.isGreen != isGreen ||
         oldDelegate.boxFit != boxFit ||
         oldDelegate.alignment != alignment;
+  }
+}
+
+class _ProcessingModeChip extends StatelessWidget {
+  const _ProcessingModeChip({required this.mode});
+
+  final ProcessingMode mode;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool live = mode == ProcessingMode.liveInMemory;
+    final Color accent = live ? Colors.greenAccent : Colors.orangeAccent;
+    final IconData icon = live ? Icons.flash_on : Icons.videocam;
+    final String label = live ? 'Live 2D' : 'Recording for offline 2D';
+
+    return Material(
+      color: Colors.black.withOpacity(0.55),
+      borderRadius: BorderRadius.circular(24),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 16, color: accent),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                color: accent,
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
