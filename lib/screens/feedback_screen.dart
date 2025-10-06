@@ -1,15 +1,16 @@
 // lib/screens/feedback_screen.dart
 // ─────────────────────────────────────────────────────────
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/material.dart';
-import 'package:video_player/video_player.dart';
-import 'package:go_router/go_router.dart';
-
-
 import 'dart:ui' show Size;
-import 'package:path_provider/path_provider.dart';
+
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'package:video_player/video_player.dart';
+
 import 'package:fit_perfect_v2/shared/services/pose_processing_controller.dart';
+import 'package:fit_perfect_v2/shared/utils/session_storage.dart';
 class FeedbackScreen extends StatefulWidget {
   const FeedbackScreen({
     super.key,
@@ -143,6 +144,7 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     super.initState();
 
     _events = _parseReport(widget.report);
+    _hydrateReportMetadata(widget.report);
 
     if (widget.videoPath != null) {
       _vc = VideoPlayerController.file(File(widget.videoPath!))
@@ -173,12 +175,160 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     _vc.addListener(() {
       if (mounted) setState(() {});
     });
+
+    unawaited(_bootstrap3DState());
   }
 
   @override
   void dispose() {
     _vc.dispose();
     super.dispose();
+  }
+
+  void _hydrateReportMetadata(Map<String, dynamic> report) {
+    _sessionId = _extractSessionId(report) ?? _sessionIdFromVideoKey();
+    final out3d = _extractOut3dPath(report);
+    if (out3d != null && out3d.isNotEmpty) {
+      _out3dPath = out3d;
+    }
+  }
+
+  Future<void> _bootstrap3DState() async {
+    if (_out3dPath != null && _out3dPath!.isNotEmpty) {
+      await _load3D(_out3dPath!);
+      return;
+    }
+
+    final sid = _sessionId;
+    if (sid == null || sid.isEmpty) {
+      return;
+    }
+
+    final existingOut = await SessionStorage.findSessionFile(sid, 'out_3d.json');
+    if (existingOut != null) {
+      if (mounted) {
+        setState(() => _out3dPath = existingOut.path);
+      } else {
+        _out3dPath = existingOut.path;
+      }
+      await _load3D(existingOut.path);
+    } else {
+      await _loadLogTail();
+    }
+  }
+
+  String? _extractSessionId(Map<String, dynamic> report) {
+    const keys = ['sessionId', 'session_id', 'session', 'session-id', 'sessionID'];
+    String? fromRoot = _lookupString(report, keys);
+    if (fromRoot != null && fromRoot.isNotEmpty) {
+      return fromRoot;
+    }
+
+    final meta = report['meta'];
+    if (meta is Map<String, dynamic>) {
+      final fromMeta = _lookupString(meta, keys);
+      if (fromMeta != null && fromMeta.isNotEmpty) {
+        return fromMeta;
+      }
+    }
+
+    final data = report['data'];
+    if (data is List) {
+      for (final row in data) {
+        if (row is Map<String, dynamic>) {
+          final candidate = _lookupString(row, keys);
+          if (candidate != null && candidate.isNotEmpty) {
+            return candidate;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  String? _extractOut3dPath(Map<String, dynamic> report) {
+    const keys = ['out3dPath', 'out_3d_path', 'out_3d', 'out3d', 'out3DPath'];
+    String? path = _lookupString(report, keys);
+    if (path != null && path.isNotEmpty) {
+      return path;
+    }
+
+    final meta = report['meta'];
+    if (meta is Map<String, dynamic>) {
+      final metaPath = _lookupString(meta, keys);
+      if (metaPath != null && metaPath.isNotEmpty) {
+        return metaPath;
+      }
+    }
+
+    final out3d = report['out3d'];
+    if (out3d is Map<String, dynamic>) {
+      final nested = _lookupString(out3d, const ['path', 'file', 'uri']);
+      if (nested != null && nested.isNotEmpty) {
+        return nested;
+      }
+    }
+
+    return null;
+  }
+
+  String? _lookupString(Map<String, dynamic> source, List<String> keys) {
+    for (final key in keys) {
+      final value = source[key];
+      final str = _valueToString(value);
+      if (str != null && str.isNotEmpty) {
+        return str;
+      }
+    }
+    return null;
+  }
+
+  String? _valueToString(dynamic value) {
+    if (value == null) return null;
+    if (value is String) {
+      final trimmed = value.trim();
+      return trimmed.isEmpty ? null : trimmed;
+    }
+    if (value is num || value is bool) {
+      return value.toString();
+    }
+    return null;
+  }
+
+  String? _sessionIdFromVideoKey() {
+    final key = widget.videoKey;
+    if (key == null || key.isEmpty) {
+      return null;
+    }
+
+    final normalized = key.replaceAll('\\', '/');
+    final parts = normalized.split('/');
+    if (parts.isEmpty) {
+      return null;
+    }
+
+    final isLocal = parts.first == 'local';
+    final isPrivateVideo =
+        parts.length >= 4 && parts[0] == 'private' && parts[1] == 'videos';
+    if (!isLocal && !isPrivateVideo) {
+      return null;
+    }
+
+    String file = '';
+    for (var i = parts.length - 1; i >= 0; i--) {
+      if (parts[i].isNotEmpty) {
+        file = parts[i];
+        break;
+      }
+    }
+
+    if (file.isEmpty) {
+      return null;
+    }
+
+    final dot = file.lastIndexOf('.');
+    final stem = dot > 0 ? file.substring(0, dot) : file;
+    return stem.isNotEmpty ? stem : null;
   }
 
   /* ─────────────────── SHOW TECHNIQUE ANIMATION ────────────────── */
@@ -324,18 +474,19 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     final sid = _sessionId;
     if (sid == null) return;
     try {
-      final docs = await getApplicationDocumentsDirectory();
-      final dir = Directory('\${docs.path}/FitPerfect/\$sid');
-      final file = File('\${dir.path}/coco_2d.jsonl');
-      if (!file.existsSync()) {
+      final file = await SessionStorage.findSessionFile(sid, 'coco_2d.jsonl');
+      if (file == null) {
+        if (!mounted) return;
         setState(() => _logTail = const ['(no coco_2d.jsonl found yet)']);
         return;
       }
       final lines = await file.readAsLines();
       final take = lines.length >= 10 ? lines.sublist(lines.length - 10) : lines;
+      if (!mounted) return;
       setState(() => _logTail = take);
     } catch (e) {
-      setState(() => _logTail = ['(could not read logs: \$e)']);
+      if (!mounted) return;
+      setState(() => _logTail = ['(could not read logs: $e)']);
     }
   }
 
@@ -377,10 +528,8 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     if (sid == null) return;
     setState(() { _retrying3D = true; _mbError = null; });
     try {
-      final docs = await getApplicationDocumentsDirectory();
-      final dir = Directory('\${docs.path}/FitPerfect/\$sid');
-      final file = File('\${dir.path}/coco_2d.jsonl');
-      if (!file.existsSync()) throw 'coco_2d.jsonl missing in \$sid';
+      final file = await SessionStorage.findSessionFile(sid, 'coco_2d.jsonl');
+      if (file == null) throw 'coco_2d.jsonl missing in $sid';
       final lines = await file.readAsLines();
       int w = 640, h = 480;
       for (final ln in lines) {
@@ -401,7 +550,8 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
         throw '3D run returned null';
       }
     } catch (e) {
-      setState(() { _mbError = 'Retry failed: \$e'; });
+      if (!mounted) return;
+      setState(() { _mbError = 'Retry failed: $e'; });
     } finally {
       if (mounted) setState(() { _retrying3D = false; });
     }

@@ -1,4 +1,5 @@
 // lib/screens/feedback_summary_screen.dart
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -6,10 +7,10 @@ import 'dart:ui' show Size;
 
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
-import 'package:path_provider/path_provider.dart';
 
 import '../shared/services/pose_processing_controller.dart';
 import '../shared/services/summary_repository.dart';
+import '../shared/utils/session_storage.dart';
 
 class FeedbackSummaryScreen extends StatefulWidget {
   const FeedbackSummaryScreen({
@@ -58,12 +59,7 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
       _out3dPath = repOut3d.toString();
     }
 
-    if (_out3dPath != null) {
-      _loading3D = true;
-      _load3D(_out3dPath!);
-    } else {
-      _loadLogTail();
-    }
+    unawaited(_refresh3DArtifacts());
   }
 
   Future<void> _load() async {
@@ -84,15 +80,40 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
             summaryOut3d is String ? summaryOut3d : summaryOut3d?.toString();
       });
 
-      if (_out3dPath != null &&
-          (_mbSummary == null || _mbSummary?['path'] != _out3dPath)) {
-        _load3D(_out3dPath!);
-      } else if (_out3dPath == null && _sessionId != null && _logTail.isEmpty) {
-        _loadLogTail();
-      }
+      unawaited(_refresh3DArtifacts());
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e);
+    }
+  }
+
+  Future<void> _refresh3DArtifacts() async {
+    final outPath = _out3dPath;
+    if (outPath != null && outPath.isNotEmpty) {
+      if (_mbSummary != null && _mbSummary?['path'] == outPath) {
+        return;
+      }
+      await _load3D(outPath);
+      return;
+    }
+
+    final sid = _sessionId;
+    if (sid == null || sid.isEmpty) {
+      return;
+    }
+
+    final existingOut = await SessionStorage.findSessionFile(sid, 'out_3d.json');
+    if (existingOut != null) {
+      if (mounted) {
+        setState(() {
+          _out3dPath = existingOut.path;
+        });
+      } else {
+        _out3dPath = existingOut.path;
+      }
+      await _load3D(existingOut.path);
+    } else if (_logTail.isEmpty) {
+      await _loadLogTail();
     }
   }
 
@@ -101,9 +122,8 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
     if (sid == null) return;
 
     try {
-      final docs = await getApplicationDocumentsDirectory();
-      final file = File('${docs.path}/FitPerfect/$sid/coco_2d.jsonl');
-      if (!await file.exists()) {
+      final file = await SessionStorage.findSessionFile(sid, 'coco_2d.jsonl');
+      if (file == null) {
         if (!mounted) return;
         setState(() {
           _logTail = const ['coco_2d.jsonl not found'];
@@ -209,10 +229,8 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
     }
 
     try {
-      final docs = await getApplicationDocumentsDirectory();
-      final dir = Directory('${docs.path}/FitPerfect/$sid');
-      final file = File('${dir.path}/coco_2d.jsonl');
-      if (!await file.exists()) {
+      final file = await SessionStorage.findSessionFile(sid, 'coco_2d.jsonl');
+      if (file == null) {
         throw 'coco_2d.jsonl missing for session $sid';
       }
 
