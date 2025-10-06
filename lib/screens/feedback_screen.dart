@@ -474,9 +474,10 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     final sid = _sessionId;
     if (sid == null) return;
     try {
-      final file = await SessionStorage.findSessionFile(sid, 'coco_2d.jsonl');
-      if (file == null) {
-        if (!mounted) return;
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('${docs.path}/FitPerfect/$sid');
+      final file = File('${dir.path}/coco_2d.jsonl');
+      if (!file.existsSync()) {
         setState(() => _logTail = const ['(no coco_2d.jsonl found yet)']);
         return;
       }
@@ -528,8 +529,10 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     if (sid == null) return;
     setState(() { _retrying3D = true; _mbError = null; });
     try {
-      final file = await SessionStorage.findSessionFile(sid, 'coco_2d.jsonl');
-      if (file == null) throw 'coco_2d.jsonl missing in $sid';
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('${docs.path}/FitPerfect/$sid');
+      final file = File('${dir.path}/coco_2d.jsonl');
+      if (!file.existsSync()) throw 'coco_2d.jsonl missing in \$sid';
       final lines = await file.readAsLines();
       int w = 640, h = 480;
       for (final ln in lines) {
