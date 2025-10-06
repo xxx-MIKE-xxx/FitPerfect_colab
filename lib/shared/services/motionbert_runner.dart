@@ -74,7 +74,24 @@ class MotionBertRunner {
       'model': modelAssetPath,
     });
 
-    final file2D = File('${sessionDir.path}/coco_2d.jsonl');
+    
+    // Robust 2D lookup: try primary then legacy path
+    final File primary2D = File('${sessionDir.path}/coco_2d.jsonl');
+    final File legacy2D  = File('${docs.path}/FitPerfect/poses/$sessionId/2d/frames.jsonl');
+    dbg?.log('MB_2D_LOOKUP', {
+      'primary': primary2D.path,
+      'legacy' : legacy2D.path,
+    });
+    final File file2D = await primary2D.exists()
+        ? primary2D
+        : (await legacy2D.exists() ? legacy2D : primary2D);
+    if (!await file2D.exists()) {
+      // Log both attempted paths before throwing
+      final msg = 'Missing 2D keypoints: tried primary=${primary2D.path} and legacy=${legacy2D.path}';
+      dbg?.log('MB_2D_LOOKUP_FAIL', {'message': msg});
+      throw StateError(msg);
+    }
+
     if (!await file2D.exists()) {
       throw StateError('Missing coco_2d.jsonl at ${file2D.path}');
     }
