@@ -117,11 +117,24 @@ class LivePoseEngine {
     final kpts640 = _decodeAuto(rtmOuts, crop.meta); // 640 coords
 
     // 5) Map kpts back to raw image space and return as offsets
-    final ptsRaw = kpts640.map((k) {
+    final rawOffsets = <Offset>[];
+    final rawTriples = <List<double>>[];
+    for (final k in kpts640) {
       final xRaw = (k[0] - lb.meta.padX) / lb.meta.scale;
       final yRaw = (k[1] - lb.meta.padY) / lb.meta.scale;
-      return Offset(xRaw, yRaw);
-    }).toList(growable: false);
+      rawOffsets.add(Offset(xRaw, yRaw));
+      rawTriples.add([xRaw, yRaw, k[2]]);
+    }
+
+    if (_jsonlSink != null && _lb != null && _roi != null) {
+      _appendJsonl(
+        kptsRaw: rawTriples,
+        bboxRaw: _roi!,
+        rawW: cam.width,
+        rawH: cam.height,
+        lb: lb.meta,
+      );
+    }
 
     if (kDebugMode && !_reportedOutputSpace) {
       debugPrint('[LivePoseEngine] Keypoints decoded from RTM crop 256x192, '
@@ -130,7 +143,7 @@ class LivePoseEngine {
     }
 
     _frameIdx++;
-    return ptsRaw;
+    return rawOffsets;
   }
 
   // ─────────────────────────── internals ───────────────────────────
@@ -446,26 +459,7 @@ class LivePoseEngine {
       kpts[j][2] = 1.0; // optional: set to 1 since we used argmax
     }
     
-    // Write JSONL (map 640 coords to raw px)
-    if (_jsonlSink != null && _lb != null && _roi != null) {
-      final rawW = cam.width;
-      final rawH = cam.height;
-      final kptsRaw = List<List<double>>.generate(17, (i) => [0.0,0.0,0.0]);
-      for (int j = 0; j < 17; j++) {
-        final xy = _lbToRawXY(kpts[j][0], kpts[j][1], _lb!);
-        kptsRaw[j][0] = xy[0];
-        kptsRaw[j][1] = xy[1];
-        kptsRaw[j][2] = kpts[j][2];
-      }
-      _appendJsonl(
-        kptsRaw: kptsRaw,
-        bboxRaw: _roi!,
-        rawW: rawW,
-        rawH: rawH,
-        lb: _lb!,
-      );
-    }
-return kpts;
+    return kpts;
   }
 
   List<List<double>> _decodeSimCC(List<OrtValue?> outs, _CropMeta meta) {
@@ -532,6 +526,34 @@ return kpts;
     return _Det(x1, y1, x2, y2, d.score);
   }
 
+  void _appendJsonl({
+    required List<List<double>> kptsRaw, // [17][3] in raw px
+    required _Det bboxRaw,               // raw px
+    required int rawW,
+    required int rawH,
+    required _LetterboxMeta lb,
+  }) {
+    if (_jsonlSink == null) return;
+    final bboxNorm = [
+      bboxRaw.x1 / rawW, bboxRaw.y1 / rawH,
+      bboxRaw.x2 / rawW, bboxRaw.y2 / rawH,
+    ];
+    final line = {
+      "t": _t++,
+      "bbox": bboxNorm,
+      "score": bboxRaw.score,
+      "kpt_coco": kptsRaw,
+      "yolo_output_units": "px",
+      "yolo_output_coords": "raw",
+      "lb_scale": lb.scale,
+      "lb_padX": lb.padX,
+      "lb_padY": lb.padY,
+      "raw_w": rawW,
+      "raw_h": rawH,
+    };
+    _jsonlSink!.writeln(jsonEncode(line));
+  }
+
   Float32List _toFloat32(dynamic v) {
     if (v is Float32List) return v;
     if (v is List) {
@@ -583,40 +605,4 @@ class _LetterboxResult {
   _LetterboxResult({required this.square, required this.meta});
   final img.Image square;
   final _LetterboxMeta meta;
-
-  void _appendJsonl({
-    required List<List<double>> kptsRaw, // [17][3] in raw px
-    required _Det bboxRaw,               // raw px
-    required int rawW,
-    required int rawH,
-    required _LetterboxMeta lb,
-  }) {
-    if (_jsonlSink == null) return;
-    final bboxNorm = [
-      bboxRaw.x1 / rawW, bboxRaw.y1 / rawH,
-      bboxRaw.x2 / rawW, bboxRaw.y2 / rawH,
-    ];
-    final line = {
-      "t": _t++,
-      "bbox": bboxNorm,
-      "score": bboxRaw.score,
-      "kpt_coco": kptsRaw,
-      "yolo_output_units": "px",
-      "yolo_output_coords": "raw",
-      "lb_scale": lb.scale,
-      "lb_padX": lb.padX,
-      "lb_padY": lb.padY,
-      "raw_w": rawW,
-      "raw_h": rawH,
-    };
-    _jsonlSink!.writeln(jsonEncode(line));
-  }
-
-  List<double> _lbToRawXY(double x, double y, _LetterboxMeta m) {
-    final rx = (x - m.padX) / m.scale;
-    final ry = (y - m.padY) / m.scale;
-    final cx = rx.clamp(0.0, m.srcW.toDouble());
-    final cy = ry.clamp(0.0, m.srcH.toDouble());
-    return [cx, cy];
-  }
 }
