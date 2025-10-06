@@ -24,6 +24,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:provider/provider.dart';
 
 import '../shared/services/api_client.dart';
 import '../shared/services/live_pose.dart'; // LIVE RTM-Pose 2D
@@ -34,7 +35,6 @@ import '../shared/services/s3_uploader.dart';
 import '../shared/services/video_transcoder.dart'; // 10fps helper
 import '../shared/widgets/live_skeleton_overlay.dart';
 import '../shared/widgets/processing_banner.dart';
-import 'package:fit_perfect_v2/shared/services/live_pose.dart';
 
 class ExercisePreviewScreen extends StatefulWidget {
   const ExercisePreviewScreen({super.key, required this.exerciseId});
@@ -46,6 +46,10 @@ class ExercisePreviewScreen extends StatefulWidget {
 
 class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     with TickerProviderStateMixin {
+  // LivePose JSONL session wiring for Option B
+  String? _sessionId;
+  bool _engineStarted = false;
+
   late final CameraController _cam;
   bool _ready = false;
   bool _recording = false;
@@ -77,18 +81,13 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
   DateTime? _recordingStartedAt;
 
   /* ───────────── live 2D pose state ───────────── */
-  final LivePoseEngine _engine = LivePoseEngine(frameStride: 5, roiMargin: 1.25);
+  final LivePoseEngine _engine = LivePoseEngine(yoloEvery: 5, roiMargin: 1.25);
   bool _streaming = false;
   bool _runningEst = false; // simple reentrancy guard
   bool _poseOk = false; // true when detected 2D matches desired pose
 
   // Live 2D export buffer (ring buffer of recent frames)
   final List<Map<String, dynamic>> _liveKptLog = <Map<String, dynamic>>[];
-  // Session + 2D jsonl writer for MotionBERT stage
-  String? _liveSessionId;
-  IOSink? _cocoSink;
-  Size? _lastFrameSize; // from camera images
-
   static const int _liveKptMax = 300; // ~ last few seconds depending on FPS
 
   /* ───────────── calibration (tilt + pose) ───────────── */
@@ -277,11 +276,25 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       // Never stream while recording
       if (_cam.value.isRecordingVideo) return;
       if (!_cam.value.isStreamingImages) {
-        await _cam.startImageStream((CameraImage img) {
+        await _cam.startImageStream((CameraImage img) async {
+          // Kick off 2D JSONL writer once per stream
+          if (!_engineStarted) {
+            _sessionId = generateSessionId();
+            try {
+              await _engine.start(controller: _cam, sessionId: _sessionId!);
+              _engineStarted = true;
+            } catch (e) {
+              if (kDebugMode) {
+                debugPrint('[ExercisePreview] engine.start error: $e');
+              }
+            }
+          }
+
           _onImageFromCamera(img); // fire-and-forget
         });
         _streaming = true;
       }
+
     } else {
       if (_cam.value.isStreamingImages) {
         try {
@@ -291,41 +304,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         await Future.delayed(const Duration(milliseconds: 30)); // let native drain
       }
     }
-  }
-
-  
-  Future<void> _ensureLiveSession() async {
-    if (_liveSessionId != null && _cocoSink != null) return;
-    _liveSessionId = _liveSessionId ?? generateSessionId();
-    final docs = await getApplicationDocumentsDirectory();
-    final dir = Directory('${docs.path}/FitPerfect/${_liveSessionId}');
-    if (!dir.existsSync()) dir.createSync(recursive: true);
-    final file = File('${dir.path}/coco_2d.jsonl');
-    _cocoSink?.close();
-    _cocoSink = file.openWrite(mode: FileMode.append);
-  }
-
-  Future<void> _appendCocoFrame(List<Offset> pts, int w, int h) async {
-    try {
-      await _ensureLiveSession();
-      final frame = {
-        't': DateTime.now().toUtc().toIso8601String(),
-        'img_w': w,
-        'img_h': h,
-        'kpt_coco': pts.map((p) => [p.dx, p.dy, 1.0]).toList(growable: false),
-      };
-      _cocoSink!.writeln(jsonEncode(frame));
-    } catch (e) {
-      if (kDebugMode) debugPrint('appendCocoFrame failed: $e');
-    }
-  }
-
-  Future<void> _closeCocoSink() async {
-    try {
-      await _cocoSink?.flush();
-      await _cocoSink?.close();
-    } catch (_) {}
-    _cocoSink = null;
   }
 
   Future<void> _onImageFromCamera(CameraImage img) async {
@@ -351,10 +329,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         if (pts != null) {
           _latestPts = pts;
           _latestImgSize = Size(img.width.toDouble(), img.height.toDouble());
-
-          _lastFrameSize = _latestImgSize;
-          // Append to live coco_2d.jsonl for MotionBERT
-          await _appendCocoFrame(pts, img.width, img.height);
 
           if (_matcher.refPoints != null) {
             // Always display (and compare against) a fixed, centered reference pose.
@@ -1157,6 +1131,24 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       _pendingRecording = null;
       final endTime = DateTime.now();
       await _stopRecordingSafely();
+      // Close LivePose JSONL and run 3D on the saved 2D if we had a session.
+      if (_engineStarted && _sessionId != null) {
+        try {
+          await _engine.stop(controller: _cam);
+        } catch (e) {
+          if (kDebugMode) debugPrint('[ExercisePreview] engine.stop error: $e');
+        }
+        try {
+          final preview = _cam.value.previewSize;
+          final w = preview == null ? 0 : preview.height.toInt();
+          final h = preview == null ? 0 : preview.width.toInt();
+          await context.read<PoseProcessingController>()
+            .run3DForSession(_sessionId!, Size(w.toDouble(), h.toDouble()));
+        } catch (e) {
+          if (kDebugMode) debugPrint('[ExercisePreview] run3DForSession error: $e');
+        }
+      }
+
       await Future.delayed(const Duration(milliseconds: 50)); // let native drain
       setState(() => _recording = false);
       _logPoseEvents = false;
@@ -1219,26 +1211,15 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     );
 
     try {
-      final sessionId = _liveSessionId ?? generateSessionId();
-      final Size frameSize = _lastFrameSize ?? ( _cam.value.previewSize != null
-          ? Size(_cam.value.previewSize!.height, _cam.value.previewSize!.width)
-          : const Size(640, 480));
-      // Ensure writer flushed
-      await _closeCocoSink();
-      final out3d = await _processingController.run3DForSession(
-        sessionId,
-        frameSize,
-        rootRelative: true,
+      final outcome = await _processingController.processRecording(
+        videoFile: videoFile,
+        meta: meta,
       );
-      final report = {
-        'sessionId': sessionId,
-        if (out3d != null) 'out3dPath': out3d.path,
-        'frames2d_logged': _liveKptLog.length,
-      };
+      final report = outcome.toFeedbackReport();
       if (!mounted) return;
       await _navigateToFeedback(
         videoFile.path,
-        'local/${widget.exerciseId}/$sessionId.mp4',
+        'local/${widget.exerciseId}/${outcome.sessionId}.mp4',
         report,
       );
       if (!mounted) return;

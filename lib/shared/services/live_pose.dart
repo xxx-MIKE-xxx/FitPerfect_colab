@@ -1,678 +1,622 @@
 // lib/shared/services/live_pose.dart
-//
-// Live image-stream 2D pose engine for Option B workflow.
-// - Starts camera image stream
-// - Processes sampled frames with YOLO→RTMPose
-// - Publishes overlay points for UI (List<Offset> of 17 keypoints)
-// - Writes one JSONL row per processed frame (COCO-17: [x,y,conf])
-//
-// This version fixes compile errors you saw:
-//  • No OrtSession type annotations (use `dynamic` via your ort_session.dart wrapper)
-//  • Handles OrtSession.run outputs as Map or List (no plugin-specific tensor cast)
-//  • Adds estimate2D(...) that accepts either CameraImage or img.Image and returns List<Offset>
-//  • overlayStream now emits List<Offset> to match UI expectations
-//  • image v4 API (img.fill, Pixel.r/g/b)
-//  • No references to dx on Strings, no MapEntry misuse in this file
-//
-// Copyright (c) FitPerfect
-
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' show Offset; // for overlay points
-
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
+import 'package:onnxruntime/onnxruntime.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'ort_session.dart';        // OrtManager.fromAsset / .run()
-import 'pipeline_debug_recorder.dart';
-import 'yuv_converter.dart';      // yuv420ToImage(CameraImage)
+import 'ort_session.dart';
+import 'tensor_utils.dart';
+import 'yuv_converter.dart';
 
-/// Live 2D engine.
 class LivePoseEngine {
-  LivePoseEngine({
-    int? frameStride,
-    int? yoloEvery,
-    this.roiMargin = 1.25,
-    this.debug = false,
-  }) : frameStride = frameStride ?? yoloEvery ?? 3;
+  LivePoseEngine({this.yoloEvery = 5, this.roiMargin = 1.25});
 
-  /// Process every Nth frame (sampling). Default 3 if not specified.
-  final int frameStride;
-
-  /// Scale bbox a bit when cropping for RTM (e.g., 1.25).
-  final double roiMargin;
-
-  /// Enable verbose pipeline diagnostics.
-  final bool debug;
-
-  static const List<String> _defaultProviders =
-      ['coreml', 'nnapi', 'xnnpack', 'cpu'];
-
-  // ───────────── runtime state ─────────────
-  bool _running = false;
-  bool _busy = false;
-  int _frameIndex = 0;
-
-  PipelineDebugRecorder? _debugger;
-  CameraController? _controller;
-  bool _savedFirstRgb = false;
-  bool _savedLetterbox = false;
-  bool _savedCrop = false;
-  int _lastOverlayFrame = -1;
-
-  // Where 2D JSONL is written during live session.
+  // Session/JSONL
+  String? _sessionId;
+  Directory? _sessionDir;
   IOSink? _jsonlSink;
-  late String _jsonlPath;
-  late String _sessionId;
-  late Directory _sessionDir;
+  String? _jsonlPath;
+  int _t = 0;
 
-  // UI overlay streams
-  final _overlayPtsCtl = StreamController<List<Offset>>.broadcast();
-  Stream<List<Offset>> get overlayStream => _overlayPtsCtl.stream; // <- used by UI
+  final int yoloEvery;     // refresh detection every N frames
+  final double roiMargin;  // crop expansion
 
-  // If a consumer wants raw data, they can listen here (optional)
-  final _overlayDataCtl = StreamController<Map<String, dynamic>>.broadcast();
-  Stream<Map<String, dynamic>> get overlayDataStream => _overlayDataCtl.stream;
+  OrtSession? _yolo;
+  OrtSession? _rtm;
 
-  // Live ORT sessions (no static types; use your wrapper)
-  dynamic _yolo;
-  dynamic _rtm;
+  Float32List? _yoloInputChw; // reusable buffer for YOLO input (1×3×640×640)
+  Float32List? _rtmInputChw;  // reusable buffer for RTMPose input (1×3×256×192)
 
-  /// Starts live processing on the given camera controller.
-  /// Returns the sessionId used for file paths.
-  Future<String> start({
-    required CameraController controller,
-    bool writeToDocuments = true,
-    String? sessionId,
-    void Function(Object error)? onError,
-  }) async {
-    if (_running) return _sessionId;
-    _running = true;
+  int _frameIdx = 0;
+  _Det? _roi;              // last person box in raw coords
+  _LetterboxMeta? _lb;     // last letterbox info to map 640→raw
+  bool _printedRtmShapes = false; // one-time debug print
+  bool _reportedOutputSpace = false; // one-time keypoint space log
 
-    _controller = controller;
-    _savedFirstRgb = false;
-    _savedLetterbox = false;
-    _savedCrop = false;
-    _lastOverlayFrame = -1;
-
-    // Resolve session folder.
-    _sessionId = sessionId ?? DateTime.now().millisecondsSinceEpoch.toString();
+  Future<void> _ensureModelsLoaded() async {
+    _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
+    _rtm  ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
+  }
+  /// Open the JSONL writer at Documents/FitPerfect/<sessionId>/coco_2d.jsonl
+  Future<void> start({required CameraController controller, required String sessionId, bool writeToDocuments = true}) async {
+    _sessionId = sessionId;
     final Directory baseDir = writeToDocuments
         ? await getApplicationDocumentsDirectory()
         : await getTemporaryDirectory();
     _sessionDir = Directory('${baseDir.path}/FitPerfect/$_sessionId');
-    if (!(await _sessionDir.exists())) {
-      await _sessionDir.create(recursive: true);
+    if (!(await _sessionDir!.exists())) {
+      await _sessionDir!.create(recursive: true);
     }
-    _jsonlPath = '${_sessionDir.path}/coco_2d.jsonl';
-    _jsonlSink = File(_jsonlPath).openWrite(mode: FileMode.append);
-
-    _debugger = debug
-        ? PipelineDebugRecorder(
-            enabled: true,
-            sessionId: _sessionId,
-            sessionDir: _sessionDir,
-          )
-        : null;
-
-    final previewSize = controller.value.previewSize;
-    _debugger?.log('SESSION_PATHS', {
-      'sessionId': _sessionId,
-      'baseDir': baseDir.path,
-      'sessionDir': _sessionDir.path,
-      'writeToDocuments': writeToDocuments,
-    });
-    _debugger?.log('CAM_CFG', {
-      'sessionId': _sessionId,
-      'lensDirection': controller.description.lensDirection.toString(),
-      'sensorOrientation': controller.description.sensorOrientation,
-      if (previewSize != null)
-        'previewSize': [previewSize.width, previewSize.height],
-    });
-    _debugger?.log('2D_SAVE_OPEN', {
-      'path': _jsonlPath,
-    });
-
-    // Init ONNX sessions once (keep in current isolate for now).
-    _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
-    _rtm  ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
-    _debugger?.log('EP_CHAIN', {
-      'yolo': _defaultProviders,
-      'rtm': _defaultProviders,
-    });
-
-    // Start image stream.
-    _frameIndex = 0;
-    await controller.startImageStream((CameraImage camImage) async {
-      // Frame sampling and backpressure.
-      if (!_running) return;
-      _frameIndex++;
-      if ((_frameIndex % frameStride) != 0) return;
-      if (_busy) return;
-      _busy = true;
-      try {
-        await _processFrame(camImage);
-      } catch (e) {
-        if (onError != null) onError(e);
-      } finally {
-        _busy = false;
-      }
-    });
-
-    return _sessionId;
+    _jsonlPath = '${_sessionDir!.path}/coco_2d.jsonl';
+    _jsonlSink = File(_jsonlPath!).openWrite(mode: FileMode.writeOnlyAppend);
+    _t = 0;
   }
 
-  /// Stops the image stream and finalizes the JSONL. Returns the JSONL path.
-  Future<String> stop({CameraController? controller}) async {
-    if (!_running) return _jsonlPath;
-    _running = false;
+  /// Flush and close the JSONL file. Returns the sessionId.
+  Future<String?> stop({required CameraController controller}) async {
     try {
-      if (controller != null && controller.value.isStreamingImages) {
-        await controller.stopImageStream();
+      await _jsonlSink?.flush();
+      await _jsonlSink?.close();
+    } finally {
+      final sid = _sessionId;
+      _jsonlSink = null;
+      _sessionId = null;
+      return sid;
+    }
+  }
+
+
+  /// Main entry: returns 17 keypoints in **raw camera space** (width×height).
+  Future<List<Offset>?> estimate2D(CameraImage cam) async {
+    await _ensureModelsLoaded();
+    // 1) YUV → RGB
+    final rgb = yuv420ToImage(cam); // width=cam.width, height=cam.height
+
+    // 2) Letterbox → 640×640 for YOLO (keep meta to unletterbox)
+    final lb = _letterbox640(rgb);
+    _lb = lb.meta;
+
+    // 3) YOLO refresh?
+    if (_roi == null || (_frameIdx % yoloEvery == 0)) {
+      final yoloIn = _prepYolo(lb.square); // (1,3,640,640)
+      final yoloOuts = await _run(_yolo!, {'images': yoloIn});
+      final det640 = _pickBestPerson(yoloOuts.first!);
+      if (det640 == null) {
+        _frameIdx++;
+        return null; // no person
       }
-    } catch (_) {}
-    await _jsonlSink?.flush();
-    await _jsonlSink?.close();
-    _debugger?.log('2D_SAVE_CLOSE', {
-      'path': _jsonlPath,
-      'bytes': await File(_jsonlPath).exists()
-          ? await File(_jsonlPath).length()
-          : 0,
-    });
-    _jsonlSink = null;
-    await _debugger?.close();
-    return _jsonlPath;
+      // Map det from 640-square back to raw frame coords
+      _roi = _lbToRaw(det640, lb.meta);
+    }
+
+    // 4) Crop & RTMPose in 640-square space for consistency
+    // Build det in 640 coords from current raw roi
+    final det640Now = _rawToLb(_roi!, lb.meta, clamp: true, margin: roiMargin);
+
+    final crop = _cropForRtm(lb.square, det640Now, outH: 256, outW: 192);
+    final rtmIn = _prepRtm(crop.image);
+    final rtmOuts = await _run(_rtm!, {'input': rtmIn});
+    if (!_printedRtmShapes && kDebugMode) {
+      final s0 = rtmOuts.isNotEmpty ? _shapeOf(rtmOuts[0]?.value) : [];
+      final s1 = rtmOuts.length > 1 ? _shapeOf(rtmOuts[1]?.value) : [];
+      debugPrint('RTM outputs shapes (live): $s0${s1.isNotEmpty ? " & $s1" : ""}');
+      _printedRtmShapes = true;
+    }
+    if (rtmOuts.isEmpty) {
+      _frameIdx++;
+      return null;
+    }
+
+    // Auto-detect SimCC vs Heatmap decoder
+    final kpts640 = _decodeAuto(rtmOuts, crop.meta); // 640 coords
+
+    // 5) Map kpts back to raw image space and return as offsets
+    final ptsRaw = kpts640.map((k) {
+      final xRaw = (k[0] - lb.meta.padX) / lb.meta.scale;
+      final yRaw = (k[1] - lb.meta.padY) / lb.meta.scale;
+      return Offset(xRaw, yRaw);
+    }).toList(growable: false);
+
+    if (kDebugMode && !_reportedOutputSpace) {
+      debugPrint('[LivePoseEngine] Keypoints decoded from RTM crop 256x192, '
+          'YOLO letterbox 640x640 → returning raw-space ${cam.width}x${cam.height} offsets');
+      _reportedOutputSpace = true;
+    }
+
+    _frameIdx++;
+    return ptsRaw;
   }
 
-  Future<void> dispose() async {
-    await _overlayPtsCtl.close();
-    await _overlayDataCtl.close();
-    try { await _yolo?.close(); } catch (_) {}
-    try { await _rtm?.close(); } catch (_) {}
-    await _debugger?.close();
+  // ─────────────────────────── internals ───────────────────────────
+
+  Future<List<OrtValue?>> _run(OrtSession s, Map<String, OrtValue> inputs) async {
+    final opts = OrtRunOptions();
+    final outs = await s.runAsync(opts, inputs);
+    opts.release();
+    for (final v in inputs.values) { v.release(); }
+    return outs ?? const [];
   }
 
-  // ───────────────────────── optional: single-frame API ─────────────────────────
-  /// Back-compat for callers that invoke per-frame 2D estimation manually.
-  /// Accepts either a CameraImage or an RGB img.Image, returns 17 Offsets.
-  Future<List<Offset>> estimate2D(dynamic frame) async {
-    _yolo ??= await OrtManager.fromAsset('assets/models/yolov8n.onnx');
-    _rtm  ??= await OrtManager.fromAsset('assets/models/rtmpose-m_256x192.onnx');
+  // Letterbox to 640×640
+  _LetterboxResult _letterbox640(img.Image src) {
+    final w = src.width, h = src.height;
+    final scale = 640.0 / math.max(w, h);
+    final nw = (w * scale).round();
+    final nh = (h * scale).round();
 
-    final img.Image rgb = (frame is CameraImage) ? yuv420ToImage(frame) : (frame as img.Image);
-    final lb = _letterbox(rgb, 640, 640, pad: const [114, 114, 114]);
-    final Float32List yoloIn = _toCHWFloat32(lb.image);
-    final yoloOut = await _yolo!.run({'images': yoloIn});
-    final Float32List pred = _asFloat32(_pickOutput(yoloOut, key: 'output0'));
-
-    final decode = _decodeYolo(pred, lbW: 640, lbH: 640);
-    final det = _pickBestPerson(decode);
-    if (det == null) return const [];
-
-    final boxPx = _unletterbox(det['xyxy'], lb);
-    final cropRes = _cropForRtm(rgb, boxPx, outH: 256, outW: 192, margin: roiMargin);
-
-    final Float32List rtmIn = _toCHWFloat32(cropRes.image);
-    final rtmOut = await _rtm!.run({'input': rtmIn});
-    final Float32List simccX = _asFloat32(_pickOutput(rtmOut, key: 'simcc_x', index: 0));
-    final Float32List simccY = _asFloat32(_pickOutput(rtmOut, key: 'simcc_y', index: 1));
-
-    final kptsIn = _simccDecode(simccX, simccY, 17, 384, 512, splitRatio: 2.0);
-    final pts = <Offset>[];
-    for (final kp in kptsIn) {
-      final x = cropRes.rx + kp[0] * (cropRes.rw / 192.0);
-      final y = cropRes.ry + kp[1] * (cropRes.rh / 256.0);
-      pts.add(Offset(x, y));
-    }
-    return pts;
-  }
-
-  // ───────────────────────── private helpers ─────────────────────────
-
-  Future<void> _processFrame(CameraImage cam) async {
-    final dbg = _debugger;
-    final int t = _frameIndex;
-
-    if (dbg != null && dbg.shouldLog('CAM', t, every: 30, first: 2)) {
-      dbg.log('CAM', {
-        't': t,
-        'resolution': [cam.width, cam.height],
-        'format': cam.format.group.toString(),
-        'planes': cam.planes.length,
-        'timestampMs': DateTime.now().millisecondsSinceEpoch,
-        if (_controller?.value.deviceOrientation != null)
-          'deviceOrientation': _controller!.value.deviceOrientation.toString(),
-      });
-    }
-
-    final yuvTimer = Stopwatch()..start();
-    final rgb = yuv420ToImage(cam);
-    final double yuvMs = yuvTimer.elapsedMicroseconds / 1000.0;
-    if (dbg != null && dbg.shouldLog('YUV2RGB', t, every: 30, first: 2)) {
-      dbg.log('YUV2RGB', {
-        't': t,
-        'converter': 'yuv420ToImage',
-        'ms': double.parse(yuvMs.toStringAsFixed(3)),
-        'outputShape': [rgb.height, rgb.width, 3],
-      });
-    }
-    if (dbg != null && dbg.enabled && !_savedFirstRgb) {
-      _savedFirstRgb = true;
-      await dbg.saveImage('frame_${t.toString().padLeft(4, '0')}_rgb.jpg', rgb);
-    }
-
-    final lbTimer = Stopwatch()..start();
-    final lb = _letterbox(rgb, 640, 640, pad: const [114, 114, 114]);
-    final double lbMs = lbTimer.elapsedMicroseconds / 1000.0;
-    if (dbg != null && dbg.shouldLog('LBX', t, every: 60, first: 5)) {
-      dbg.log('LBX', {
-        't': t,
-        'src': [rgb.height, rgb.width],
-        'scale': lb.r,
-        'dw': lb.dw,
-        'dh': lb.dh,
-        'fill': const [114, 114, 114],
-        'out': [lb.image.height, lb.image.width],
-        'ms': double.parse(lbMs.toStringAsFixed(3)),
-      });
-    }
-    if (dbg != null && dbg.enabled && !_savedLetterbox) {
-      _savedLetterbox = true;
-      await dbg.saveImage('t${t.toString().padLeft(4, '0')}_letterbox.jpg', lb.image);
-    }
-
-    final Float32List yoloIn = _toCHWFloat32(lb.image); // 3*640*640
-    if (dbg != null && dbg.shouldLog('YOLO_IN', t, every: 30, first: 5)) {
-      dbg.log('YOLO_IN', {
-        't': t,
-        'shape': [1, 3, 640, 640],
-        'normalization': 'rgb/255',
-      });
-    }
-
-    final yoloTimer = Stopwatch()..start();
-    final yoloOut = await _yolo!.run({'images': yoloIn});
-    final double yoloMs = yoloTimer.elapsedMicroseconds / 1000.0;
-    final Float32List pred = _asFloat32(_pickOutput(yoloOut, key: 'output0'));
-    if (dbg != null && dbg.shouldLog('YOLO_EP', t, every: 30, first: 5)) {
-      dbg.log('YOLO_EP', {
-        't': t,
-        'providers': _defaultProviders,
-        'ms': double.parse(yoloMs.toStringAsFixed(3)),
-      });
-    }
-    if (dbg != null && dbg.shouldLog('YOLO_RAW', t, every: 30, first: 5)) {
-      final List<double> firstVals = [];
-      for (int i = 0; i < math.min(3, pred.length); i++) {
-        firstVals.add(double.parse(pred[i].toStringAsFixed(4)));
-      }
-      dbg.log('YOLO_RAW', {
-        't': t,
-        'shape': [1, 84, pred.length ~/ 84],
-        'first3': firstVals,
-      });
-    }
-
-    final decode = _decodeYolo(pred, lbW: 640, lbH: 640);
-    final det = _pickBestPerson(decode);
-    if (dbg != null && dbg.shouldLog('YOLO_DET', t, every: 10, first: 5)) {
-      dbg.log('YOLO_DET', {
-        't': t,
-        'valid': decode.length,
-        'maxScore': det == null ? 0.0 : (det['score'] as double),
-        'bbox_lb': det == null ? null : List<double>.from(det['xyxy'] as List),
-        'norm': true,
-      });
-    }
-    if (det == null) {
-      return;
-    }
-
-    final boxPx = _unletterbox(List<double>.from(det['xyxy'] as List<double>), lb);
-    if (dbg != null && dbg.shouldLog('UNPAD', t, every: 30, first: 5)) {
-      dbg.log('UNPAD', {
-        't': t,
-        'bbox_img': boxPx,
-        'r': lb.r,
-        'dw': lb.dw,
-        'dh': lb.dh,
-      });
-    }
-
-    final cropRes =
-        _cropForRtm(rgb, boxPx, outH: 256, outW: 192, margin: roiMargin);
-    if (dbg != null && dbg.shouldLog('CROP', t, every: 30, first: 5)) {
-      dbg.log('CROP', {
-        't': t,
-        'bbox': boxPx,
-        'rect': [cropRes.rx, cropRes.ry, cropRes.rw, cropRes.rh],
-        'scale': roiMargin,
-        'out': [256, 192],
-      });
-    }
-    if (dbg != null && dbg.enabled && !_savedCrop) {
-      _savedCrop = true;
-      await dbg.saveImage('t${t.toString().padLeft(4, '0')}_cropped.jpg', cropRes.image);
-    }
-
-    final Float32List rtmIn = _toCHWFloat32(cropRes.image);
-    if (dbg != null && dbg.shouldLog('RTM_IN', t, every: 30, first: 5)) {
-      dbg.log('RTM_IN', {
-        't': t,
-        'shape': [1, 3, 256, 192],
-        'normalization': 'rgb/255',
-      });
-    }
-
-    final rtmTimer = Stopwatch()..start();
-    final rtmOut = await _rtm!.run({'input': rtmIn});
-    final double rtmMs = rtmTimer.elapsedMicroseconds / 1000.0;
-    final Float32List simccX =
-        _asFloat32(_pickOutput(rtmOut, key: 'simcc_x', index: 0));
-    final Float32List simccY =
-        _asFloat32(_pickOutput(rtmOut, key: 'simcc_y', index: 1));
-    if (dbg != null && dbg.shouldLog('RTM_EP', t, every: 30, first: 5)) {
-      dbg.log('RTM_EP', {
-        't': t,
-        'providers': _defaultProviders,
-        'ms': double.parse(rtmMs.toStringAsFixed(3)),
-      });
-    }
-
-    final kptsIn =
-        _simccDecode(simccX, simccY, 17, 384, 512, splitRatio: 2.0);
-
-    if (dbg != null && dbg.shouldLog('RTM_OUT', t, every: 30, first: 5)) {
-      final confidences = kptsIn
-          .map((kp) => kp.length > 2 ? kp[2] : 0.0)
-          .toList(growable: false);
-      confidences.sort((a, b) => b.compareTo(a));
-      dbg.log('RTM_OUT', {
-        't': t,
-        'simcc': {'x': [1, 17, 384], 'y': [1, 17, 512]},
-        'topConf': confidences.take(3).toList(),
-      });
-    }
-
-    // Build overlay points and data.
-    final pts = <Offset>[];
-    final kptsPx = <List<double>>[];
-    for (final kp in kptsIn) {
-      final x = cropRes.rx + kp[0] * (cropRes.rw / 192.0);
-      final y = cropRes.ry + kp[1] * (cropRes.rh / 256.0);
-      final c = kp[2];
-      pts.add(Offset(x, y));
-      kptsPx.add([x, y, c]);
-    }
-
-    if (dbg != null && dbg.shouldLog('KPTS_IMG', t, every: 10, first: 5)) {
-      double minX = double.infinity,
-          maxX = -double.infinity,
-          minY = double.infinity,
-          maxY = -double.infinity,
-          confSum = 0.0;
-      for (final kp in kptsPx) {
-        minX = math.min(minX, kp[0]);
-        maxX = math.max(maxX, kp[0]);
-        minY = math.min(minY, kp[1]);
-        maxY = math.max(maxY, kp[1]);
-        confSum += kp[2];
-      }
-      final confMean = kptsPx.isEmpty ? 0.0 : confSum / kptsPx.length;
-      dbg.log('KPTS_IMG', {
-        't': t,
-        'conf_mean': double.parse(confMean.toStringAsFixed(4)),
-        'x_ptp': maxX - minX,
-        'y_ptp': maxY - minY,
-      });
-    }
-
-    if (dbg != null && dbg.shouldLog('OVERLAY', t, every: 60, first: 2) &&
-        t != _lastOverlayFrame) {
-      final overlay = _drawOverlay(rgb, boxPx, kptsPx);
-      await dbg.saveImage('overlay_t${t.toString().padLeft(4, '0')}.jpg', overlay);
-      dbg.log('OVERLAY', {
-        't': t,
-        'path':
-            '${_sessionDir.path}/overlay_t${t.toString().padLeft(4, '0')}.jpg',
-      });
-      _lastOverlayFrame = t;
-    }
-
-    // Publish overlays (points first for UI, raw data optional).
-    _overlayPtsCtl.add(pts);
-    _overlayDataCtl.add({
-      'bbox': [boxPx[0], boxPx[1], boxPx[2], boxPx[3]],
-      'kpts': kptsPx,
-    });
-
-    // Write JSONL line (normalized bbox, absolute kpts).
-    final w = rgb.width.toDouble();
-    final h = rgb.height.toDouble();
-    final line = json.encode({
-      't': _frameIndex,
-      'bbox': [boxPx[0] / w, boxPx[1] / h, boxPx[2] / w, boxPx[3] / h],
-      'score': det['score'],
-      'kpt_coco': kptsPx,
-      'yolo_output_units': 'normalized_640_letterbox',
-      'yolo_output_coords': 'letterbox',
-      'lb': {'r': lb.r, 'dw': lb.dw, 'dh': lb.dh},
-    });
-    _jsonlSink?.writeln(line);
-    if (dbg != null && dbg.shouldLog('2D_SAVE_WRITE', t, every: 30, first: 5)) {
-      dbg.log('2D_SAVE_WRITE', {
-        't': t,
-        'path': _jsonlPath,
-        'bytes': line.length,
-      });
-    }
-  }
-
-  // Convert img.Image (RGB888) to CHW float32 [0..1].
-  Float32List _toCHWFloat32(img.Image im) {
-    final h = im.height, w = im.width;
-    final out = Float32List(3 * h * w);
-    int i0 = 0, i1 = h * w, i2 = 2 * h * w;
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        final px = im.getPixel(x, y);     // Pixel in image v4
-        out[i0++] = px.r / 255.0;
-        out[i1++] = px.g / 255.0;
-        out[i2++] = px.b / 255.0;
-      }
-    }
-    return out;
-  }
-
-  /// Decode YOLOv8 flattened output into a list of detections.
-  /// Expect layout [1,84,N] flattened → iterate N anchors, each 84 values.
-  List<Map<String, dynamic>> _decodeYolo(Float32List pred, {int lbW = 640, int lbH = 640}) {
-    final res = <Map<String, dynamic>>[];
-    const stride = 84;
-    final N = pred.length ~/ stride;
-    for (int i = 0; i < N; i++) {
-      final off = i * stride;
-      final cx = pred[off + 0];
-      final cy = pred[off + 1];
-      final w  = pred[off + 2];
-      final h  = pred[off + 3];
-      // Person class prob at index 4 (sigmoid)
-      final score = 1.0 / (1.0 + math.exp(-(pred[off + 4])));
-      if (score < 0.15) continue;
-      final x1 = (cx - w / 2.0) * lbW;
-      final y1 = (cy - h / 2.0) * lbH;
-      final x2 = (cx + w / 2.0) * lbW;
-      final y2 = (cy + h / 2.0) * lbH;
-      res.add({'xyxy': [x1, y1, x2, y2], 'score': score});
-    }
-    return res;
-  }
-
-  Map<String, dynamic>? _pickBestPerson(List<Map<String, dynamic>> dets) {
-    if (dets.isEmpty) return null;
-    dets.sort((a, b) => (b['score'] as double).compareTo(a['score'] as double));
-    return dets.first;
-  }
-
-  // Letterbox with pad color [r,g,b] using image v4 API.
-  _LetterboxResult _letterbox(img.Image src, int outW, int outH, {required List<int> pad}) {
-    final r = math.min(outW / src.width, outH / src.height);
-    final newW = (src.width * r).round();
-    final newH = (src.height * r).round();
-    final dw = ((outW - newW) / 2.0);
-    final dh = ((outH - newH) / 2.0);
-
-    final canvas = img.Image(width: outW, height: outH);
-    // Fill background with pad color (v4: use top-level img.fill with Color)
-    img.fill(canvas, color: img.ColorRgb8(pad[0], pad[1], pad[2]));
-
-    final resized = img.copyResize(src, width: newW, height: newH, interpolation: img.Interpolation.linear);
-    img.compositeImage(canvas, resized, dstX: dw.round(), dstY: dh.round());
-    return _LetterboxResult(canvas, r, dw, dh);
-  }
-
-  // Undo letterbox to original image coords.
-  List<double> _unletterbox(List<double> xyxy, _LetterboxResult lb) {
-    return [
-      (xyxy[0] - lb.dw) / lb.r,
-      (xyxy[1] - lb.dh) / lb.r,
-      (xyxy[2] - lb.dw) / lb.r,
-      (xyxy[3] - lb.dh) / lb.r,
-    ];
-  }
-
-  // Crop ROI around bbox with margin and resize for RTM.
-  _CropResult _cropForRtm(img.Image src, List<double> xyxy, {required int outH, required int outW, double margin = 1.25}) {
-    final x1 = xyxy[0], y1 = xyxy[1], x2 = xyxy[2], y2 = xyxy[3];
-    final cx = (x1 + x2) / 2.0;
-    final cy = (y1 + y2) / 2.0;
-    double w = (x2 - x1).abs();
-    double h = (y2 - y1).abs();
-    final scale = margin;
-    w *= scale; h *= scale;
-
-    // keep aspect 192x256
-    final target = outW / outH; // 192/256
-    double rw = w, rh = h;
-    if ((w / h) > target) {
-      rh = w / target;
-    } else {
-      rw = h * target;
-    }
-
-    double rx = cx - rw / 2.0;
-    double ry = cy - rh / 2.0;
-    rx = rx.clamp(0.0, src.width.toDouble());
-    ry = ry.clamp(0.0, src.height.toDouble());
-    rw = math.min(rw, src.width - rx);
-    rh = math.min(rh, src.height - ry);
-
-    final crop = img.copyCrop(src, x: rx.round(), y: ry.round(), width: rw.round(), height: rh.round());
-    final resized = img.copyResize(crop, width: outW, height: outH, interpolation: img.Interpolation.linear);
-    return _CropResult(resized, rx, ry, rw, rh);
-  }
-
-  img.Image _drawOverlay(img.Image base, List<double> bbox, List<List<double>> kpts) {
-    final overlay = img.copyResize(base,
-      width: base.width,
-      height: base.height,
-      interpolation: img.Interpolation.nearest);
-    img.drawRect(
-    overlay,
-      x1: bbox[0].round(),
-      y1: bbox[1].round(),
-      x2: bbox[2].round(),
-      y2: bbox[3].round(),
-      color: img.ColorRgb8(0, 255, 0),
+    final resized = img.copyResize(
+      src,
+      width: nw,
+      height: nh,
+      interpolation: img.Interpolation.average,
     );
-    for (final kp in kpts) {
-      img.drawCircle(
-        overlay,
-        x: kp[0].round(),
-        y: kp[1].round(),
-        radius: 3,
-        color: img.ColorRgb8(255, 0, 0),
+
+    // Create 640×640 black canvas
+    final out = img.Image(width: 640, height: 640);
+    img.fill(out, color: img.ColorRgb8(0, 0, 0));
+
+    // Center the resized image
+    final padX = ((640 - nw) ~/ 2);
+    final padY = ((640 - nh) ~/ 2);
+
+    // Fast path: let image package do the blit in one go
+    final composited = img.compositeImage(out, resized, dstX: padX, dstY: padY);
+
+    return _LetterboxResult(
+      square: composited,
+      meta: _LetterboxMeta(
+        srcW: w,
+        srcH: h,
+        scale: scale,
+        padX: padX.toDouble(),
+        padY: padY.toDouble(),
+      ),
+    );
+  }
+
+  OrtValue _prepYolo(img.Image im) {
+    final w = im.width, h = im.height; // 640×640
+    final plane = w * h;
+    final needed = 3 * plane;
+    if (_yoloInputChw == null || _yoloInputChw!.length != needed) {
+      _yoloInputChw = Float32List(needed);
+    }
+
+    final chw = _yoloInputChw!;
+    final bytes = im.getBytes(order: img.ChannelOrder.rgb);
+
+    for (int i = 0, p = 0; p < plane; p++) {
+      final r = bytes[i++] / 255.0;
+      final g = bytes[i++] / 255.0;
+      final b = bytes[i++] / 255.0;
+      chw[p] = r;
+      chw[plane + p] = g;
+      chw[(plane << 1) + p] = b;
+    }
+
+    return OrtValueTensor.createTensorWithDataList(chw, [1, 3, h, w]);
+  }
+
+  // ───────────────── YOLO decode (robust to shape & scale) ─────────────────
+  _Det? _pickBestPerson(OrtValue out) {
+    final v = out.value;
+    final shp = _shapeOf(v); // e.g., [1, 84, 8400] or [1, 8400, 84]
+    if (shp.length != 3) {
+      // Fallback: flatten assuming stride 84
+      final flat = _toFloat32(v);
+      if (flat.isEmpty || flat.length % 84 != 0) return null;
+      return _scanYoloFlat(flat, stride: 84);
+    }
+
+    // Normalize into a uniform iterator of (cx,cy,w,h,obj,cls0) across proposals.
+    // Case A: [1, 84, N]   -> channels-first
+    // Case B: [1, N, 84]   -> channels-last
+    final arr = _toList3D(v); // List[1][A][B]
+    final A = arr[0].length;
+    final B = arr[0][0].length;
+
+    double bestScore = 0.0;
+    _Det? best;
+
+    if (A == 84) {
+      // [1, 84, N]
+      final N = B;
+      for (int i = 0; i < N; i++) {
+        final cx = arr[0][0][i];
+        final cy = arr[0][1][i];
+        final w  = arr[0][2][i];
+        final h  = arr[0][3][i];
+        final obj  = arr[0][4][i];
+        final cls0 = arr[0][5][i]; // "person"
+        final det = _mkDet(cx, cy, w, h, obj, cls0);
+        if (det != null && det.score > bestScore) { bestScore = det.score; best = det; }
+      }
+    } else if (B == 84) {
+      // [1, N, 84]
+      final N = A;
+      for (int i = 0; i < N; i++) {
+        final row = arr[0][i];
+        final cx = row[0];
+        final cy = row[1];
+        final w  = row[2];
+        final h  = row[3];
+        final obj  = row[4];
+        final cls0 = row[5]; // "person"
+        final det = _mkDet(cx, cy, w, h, obj, cls0);
+        if (det != null && det.score > bestScore) { bestScore = det.score; best = det; }
+      }
+    } else {
+      // Unexpected; fallback to flat
+      final flat = _toFloat32(v);
+      if (flat.isEmpty || flat.length % 84 != 0) return null;
+      return _scanYoloFlat(flat, stride: 84);
+    }
+
+    if (kDebugMode && best != null) {
+      debugPrint(
+        'YOLO best det 640: '
+        'x1=${(best.x1/640.0).toStringAsFixed(1)} '
+        'y1=${(best.y1/640.0).toStringAsFixed(1)} '
+        'x2=${(best.x2/640.0).toStringAsFixed(1)} '
+        'y2=${(best.y2/640.0).toStringAsFixed(1)} '
+        'score=${best.score.toStringAsFixed(3)}'
       );
     }
-    return overlay;
-}
-
-  /// Minimal SimCC decoder: argmax on each joint's x/y logits.
-  /// simccX: [1,J,W], simccY: [1,J,H]; coords returned in input-space (W->192, H->256) via splitRatio.
-  List<List<double>> _simccDecode(Float32List simccX, Float32List simccY, int J, int Wx, int Hy, {double splitRatio = 2.0}) {
-    final out = <List<double>>[];
-    // Expect [J,Wx] after removing batch dim 1 (contiguous packing).
-    for (int j = 0; j < J; j++) {
-      int offX = j * Wx;
-      int offY = j * Hy;
-      // argmax X
-      int ix = 0; double vx = -1e30;
-      for (int k = 0; k < Wx; k++) {
-        final v = simccX[offX + k];
-        if (v > vx) { vx = v; ix = k; }
-      }
-      // argmax Y
-      int iy = 0; double vy = -1e30;
-      for (int k = 0; k < Hy; k++) {
-        final v = simccY[offY + k];
-        if (v > vy) { vy = v; iy = k; }
-      }
-      final x = ix / splitRatio; // 384/2 -> 192
-      final y = iy / splitRatio; // 512/2 -> 256
-      // crude confidence as mean of peak logits
-      final c = ((vx + vy) / 2.0);
-      out.add([x.toDouble(), y.toDouble(), c]);
-    }
-    return out;
+    return best;
   }
 
-  // Pick output tensor by key (Map) or index (List); returns dynamic.
-  dynamic _pickOutput(dynamic out, {String? key, int index = 0}) {
-    if (out is Map && key != null && out.containsKey(key)) return out[key];
-    if (out is Map && out.isNotEmpty) return out.values.first;
-    if (out is List && out.isNotEmpty) {
-      if (index >= 0 && index < out.length) return out[index];
-      return out.first;
-    }
-    return out; // already a tensor
+  // Build a detection in 640-space, auto-scaling if inputs are normalized.
+  _Det? _mkDet(double cx, double cy, double w, double h, double obj, double cls0) {
+    // If numbers look like 0..1, scale to 640.
+    final bool normalized = (cx <= 1.5 && cy <= 1.5 && w <= 1.5 && h <= 1.5);
+    final s = normalized ? 640.0 : 1.0;
+
+    final cxp = cx * s, cyp = cy * s, wp = w * s, hp = h * s;
+
+    if (wp <= 1 || hp <= 1) return null; // ignore degenerate boxes
+
+    final x1 = (cxp - wp / 2).clamp(0.0, 640.0);
+    final y1 = (cyp - hp / 2).clamp(0.0, 640.0);
+    final x2 = (cxp + wp / 2).clamp(0.0, 640.0);
+    final y2 = (cyp + hp / 2).clamp(0.0, 640.0);
+
+    if (x2 <= x1 || y2 <= y1) return null;
+
+    // Score: objectness * class(person) with sigmoid just in case
+    final score = _sigmoid(obj) * _sigmoid(cls0);
+    if (score < 0.25) return null;
+
+    return _Det(x1, y1, x2, y2, score);
   }
 
-  // Convert various OrtValue/tensor shapes to Float32List.
-  Float32List _asFloat32(dynamic v) {
+  _Det? _scanYoloFlat(Float32List flat, {required int stride}) {
+    double bestScore = 0.0;
+    _Det? best;
+    final n = flat.length ~/ stride;
+    for (int i = 0; i < n; i++) {
+      final off = i * stride;
+      final cx = flat[off + 0];
+      final cy = flat[off + 1];
+      final w  = flat[off + 2];
+      final h  = flat[off + 3];
+      final obj  = flat[off + 4];
+      final cls0 = flat[off + 5];
+      final det = _mkDet(cx, cy, w, h, obj, cls0);
+      if (det != null && det.score > bestScore) { bestScore = det.score; best = det; }
+    }
+    return best;
+  }
+
+  double _sigmoid(double x) => 1 / (1 + math.exp(-x));
+
+  // Crop & resize (640 space) for RTMPose
+  _CropResult _cropForRtm(img.Image im640, _Det det, {required int outH, required int outW}) {
+    final x1 = det.x1.clamp(0.0, im640.width.toDouble());
+    final y1 = det.y1.clamp(0.0, im640.height.toDouble());
+    final x2 = det.x2.clamp(0.0, im640.width.toDouble());
+    final y2 = det.y2.clamp(0.0, im640.height.toDouble());
+
+    final crop = img.copyCrop(
+      im640,
+      x: x1.toInt(),
+      y: y1.toInt(),
+      width: (x2 - x1).toInt(),
+      height: (y2 - y1).toInt(),
+    );
+
+    final resized = img.copyResize(
+      crop, width: outW, height: outH, interpolation: img.Interpolation.average);
+
+    final meta = _CropMeta(
+      roiX: x1, roiY: y1,
+      roiW: (x2 - x1), roiH: (y2 - y1),
+      outW: outW, outH: outH,
+    );
+    return _CropResult(resized, meta);
+  }
+
+  OrtValue _prepRtm(img.Image patch) {
+    const mean = [0.485, 0.456, 0.406];
+    const std  = [0.229, 0.224, 0.225];
+    final h = patch.height, w = patch.width; // 256×192
+    final plane = w * h;
+    final needed = 3 * plane;
+    if (_rtmInputChw == null || _rtmInputChw!.length != needed) {
+      _rtmInputChw = Float32List(needed);
+    }
+
+    final chw = _rtmInputChw!;
+    final bytes = patch.getBytes(order: img.ChannelOrder.rgb);
+
+    for (int i = 0, p = 0; p < plane; p++) {
+      final r = bytes[i++] / 255.0;
+      final g = bytes[i++] / 255.0;
+      final b = bytes[i++] / 255.0;
+
+      chw[p] = (r - mean[0]) / std[0];
+      chw[plane + p] = (g - mean[1]) / std[1];
+      chw[(plane << 1) + p] = (b - mean[2]) / std[2];
+    }
+
+    return OrtValueTensor.createTensorWithDataList(chw, [1, 3, h, w]);
+  }
+
+  // ---------- NEW: Auto-detect SimCC vs Heatmap and decode accordingly
+
+  // Inspect nested list tensor shape (for debug/branching)
+  List<int> _shapeOf(dynamic v) {
+    final dims = <int>[];
+    dynamic a = v;
+    while (a is List) {
+      dims.add(a.length);
+      a = a.isNotEmpty ? a[0] : null;
+    }
+    return dims;
+  }
+
+  List<List<double>> _decodeAuto(List<OrtValue?> outs, _CropMeta meta) {
+    if (outs.isEmpty || outs[0] == null) {
+      return List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    }
+    final v0 = outs[0]!.value;
+    final s0 = _shapeOf(v0);
+
+    // Heatmap ONNX commonly returns [1, K, H, W]
+    if (s0.length == 4) {
+      return _decodeHeatmap(outs[0]!, meta);
+    }
+
+    // SimCC ONNX: two outputs [1, K, 384] & [1, K, 512] (order may vary)
+    if (outs.length >= 2) {
+      final s1 = _shapeOf(outs[1]!.value);
+      final looksSimCC = s0.length == 3 && s1.length == 3 && s0[0] == 1 && s1[0] == 1;
+      if (looksSimCC) {
+        // Make sure first is X (smaller bins) and second is Y (larger bins)
+        final xFirst = s0.isNotEmpty && s1.isNotEmpty && s0.last <= s1.last;
+        final pair = xFirst ? outs : [outs[1], outs[0]];
+        return _decodeSimCC(pair, meta);
+      }
+    }
+
+    // Fallback: try heatmap on first output
+    return _decodeHeatmap(outs[0]!, meta);
+  }
+
+  // Heatmap decoder: argmax per joint over H×W plane, then map from 256×192 crop back to 640 space.
+  List<List<double>> _decodeHeatmap(OrtValue heat, _CropMeta meta) {
+    // heat.value is nested lists [1][K][H][W]
+    final n1 = heat.value as List;            // [1]
+    if (n1.isEmpty) return List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    final nk = n1[0] as List;                 // [K]
+    final K = nk.length;
+
+    // infer H, W from first joint
+    final H = (nk[0] as List).length;
+    final W = ((nk[0] as List)[0] as List).length;
+
+    final List<List<double>> kpts = List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    for (int j = 0; j < (K < 17 ? K : 17); j++) {
+      final plane = nk[j] as List;            // [H][W]
+      double best = -1e9;
+      int by = 0, bx = 0;
+      for (int y = 0; y < H; y++) {
+        final row = plane[y] as List;
+        for (int x = 0; x < W; x++) {
+          final v = (row[x] as num).toDouble();
+          if (v > best) { best = v; by = y; bx = x; }
+        }
+      }
+
+      // Back to 256×192 crop coords (center of the heatmap cell)
+      final px = (bx + 0.5) * (meta.outW / W);
+      final py = (by + 0.5) * (meta.outH / H);
+
+      // Then to the 640×640 ROI coords
+      final x = meta.roiX + (px / meta.outW) * meta.roiW;
+      final y = meta.roiY + (py / meta.outH) * meta.roiH;
+
+      kpts[j][0] = x;
+      kpts[j][1] = y;
+      kpts[j][2] = 1.0; // optional: set to 1 since we used argmax
+    }
+    
+    // Write JSONL (map 640 coords to raw px)
+    if (_jsonlSink != null && _lb != null && _roi != null) {
+      final rawW = cam.width;
+      final rawH = cam.height;
+      final kptsRaw = List<List<double>>.generate(17, (i) => [0.0,0.0,0.0]);
+      for (int j = 0; j < 17; j++) {
+        final xy = _lbToRawXY(kpts[j][0], kpts[j][1], _lb!);
+        kptsRaw[j][0] = xy[0];
+        kptsRaw[j][1] = xy[1];
+        kptsRaw[j][2] = kpts[j][2];
+      }
+      _appendJsonl(
+        kptsRaw: kptsRaw,
+        bboxRaw: _roi!,
+        rawW: rawW,
+        rawH: rawH,
+        lb: _lb!,
+      );
+    }
+return kpts;
+  }
+
+  List<List<double>> _decodeSimCC(List<OrtValue?> outs, _CropMeta meta) {
+    final simccX = _toList3D(outs[0]!.value); // [1,17,384]
+    final simccY = _toList3D(outs[1]!.value); // [1,17,512]
+    const split = 2.0;
+
+    final List<List<double>> kpts = List.generate(17, (_) => [0.0, 0.0, 0.0]);
+    for (int j = 0; j < 17; j++) {
+      final rowX = simccX[0][j];
+      final rowY = simccY[0][j];
+      int ix = 0, iy = 0;
+      double vx = -1e9, vy = -1e9;
+      for (int t = 0; t < rowX.length; t++) { if (rowX[t] > vx) { vx = rowX[t]; ix = t; } }
+      for (int t = 0; t < rowY.length; t++) { if (rowY[t] > vy) { vy = rowY[t]; iy = t; } }
+
+      final px = ix / split; // 0..192
+      final py = iy / split; // 0..256
+
+      final x = meta.roiX + (px / meta.outW) * meta.roiW;
+      final y = meta.roiY + (py / meta.outH) * meta.roiH;
+      final conf = math.min(1.0, math.max(0.0, (vx + vy) / 2.0));
+
+      kpts[j][0] = x; // still in 640 space
+      kpts[j][1] = y;
+      kpts[j][2] = conf;
+    }
+    return kpts;
+  }
+
+  // Map det in 640 space → raw space
+  _Det _lbToRaw(_Det d, _LetterboxMeta m) {
+    final x1 = (d.x1 - m.padX) / m.scale;
+    final y1 = (d.y1 - m.padY) / m.scale;
+    final x2 = (d.x2 - m.padX) / m.scale;
+    final y2 = (d.y2 - m.padY) / m.scale;
+    return _Det(x1, y1, x2, y2, d.score);
+  }
+
+  // Map det in raw space → 640 space (optionally expand margin and clamp)
+  _Det _rawToLb(_Det d, _LetterboxMeta m, {bool clamp = true, double margin = 1.0}) {
+    final cx = (d.x1 + d.x2) * 0.5;
+    final cy = (d.y1 + d.y2) * 0.5;
+    final w  = (d.x2 - d.x1) * margin;
+    final h  = (d.y2 - d.y1) * margin;
+
+    double x1 = cx - w * 0.5;
+    double y1 = cy - h * 0.5;
+    double x2 = cx + w * 0.5;
+    double y2 = cy + h * 0.5;
+
+    // to 640
+    x1 = x1 * m.scale + m.padX;
+    y1 = y1 * m.scale + m.padY;
+    x2 = x2 * m.scale + m.padX;
+    y2 = y2 * m.scale + m.padY;
+
+    if (clamp) {
+      x1 = x1.clamp(0.0, 640.0);
+      y1 = y1.clamp(0.0, 640.0);
+      x2 = x2.clamp(0.0, 640.0);
+      y2 = y2.clamp(0.0, 640.0);
+    }
+    return _Det(x1, y1, x2, y2, d.score);
+  }
+
+  Float32List _toFloat32(dynamic v) {
     if (v is Float32List) return v;
-    // Common plugin wrapper types expose .data or .value
-    try {
-      final d = (v as dynamic).data;
-      if (d is Float32List) return d;
-      if (d is List) return Float32List.fromList(d.map((e) => (e as num).toDouble()).toList());
-    } catch (_) {}
-    try {
-      final d = (v as dynamic).value;
-      if (d is Float32List) return d;
-      if (d is List) return Float32List.fromList(d.map((e) => (e as num).toDouble()).toList());
-    } catch (_) {}
     if (v is List) {
-      // Assume flat numeric list
-      return Float32List.fromList(v.map((e) => (e as num).toDouble()).toList());
+      final flat = <double>[];
+      void walk(dynamic a) {
+        if (a is List) { for (final e in a) walk(e); }
+        else if (a is num) flat.add(a.toDouble());
+      }
+      walk(v);
+      return Float32List.fromList(flat);
     }
-    throw StateError('Unsupported tensor type: ${v.runtimeType}');
+    return Float32List(0);
   }
+
+  List<List<List<double>>> _toList3D(dynamic v) =>
+      (v as List).map<List<List<double>>>((a) =>
+        (a as List).map<List<double>>((b) =>
+          (b as List).map<double>((c) => (c as num).toDouble()).toList()
+        ).toList()
+      ).toList();
 }
 
+// ───────── data holders ─────────
+class _Det { _Det(this.x1, this.y1, this.x2, this.y2, this.score);
+  final double x1, y1, x2, y2, score; }
+
+class _CropMeta {
+  _CropMeta({
+    required this.roiX, required this.roiY,
+    required this.roiW, required this.roiH,
+    required this.outW, required this.outH,
+  });
+  final double roiX, roiY, roiW, roiH;
+  final int outW, outH;
+}
+
+class _CropResult { _CropResult(this.image, this.meta);
+  final img.Image image; final _CropMeta meta; }
+
+class _LetterboxMeta {
+  _LetterboxMeta({
+    required this.srcW, required this.srcH,
+    required this.scale, required this.padX, required this.padY,
+  });
+  final int srcW, srcH;
+  final double scale, padX, padY;
+}
 class _LetterboxResult {
-  _LetterboxResult(this.image, this.r, this.dw, this.dh);
-  final img.Image image;
-  final double r;
-  final double dw;
-  final double dh;
-}
+  _LetterboxResult({required this.square, required this.meta});
+  final img.Image square;
+  final _LetterboxMeta meta;
 
-class _CropResult {
-  _CropResult(this.image, this.rx, this.ry, this.rw, this.rh);
-  final img.Image image;
-  final double rx, ry, rw, rh;
+  void _appendJsonl({
+    required List<List<double>> kptsRaw, // [17][3] in raw px
+    required _Det bboxRaw,               // raw px
+    required int rawW,
+    required int rawH,
+    required _LetterboxMeta lb,
+  }) {
+    if (_jsonlSink == null) return;
+    final bboxNorm = [
+      bboxRaw.x1 / rawW, bboxRaw.y1 / rawH,
+      bboxRaw.x2 / rawW, bboxRaw.y2 / rawH,
+    ];
+    final line = {
+      "t": _t++,
+      "bbox": bboxNorm,
+      "score": bboxRaw.score,
+      "kpt_coco": kptsRaw,
+      "yolo_output_units": "px",
+      "yolo_output_coords": "raw",
+      "lb_scale": lb.scale,
+      "lb_padX": lb.padX,
+      "lb_padY": lb.padY,
+      "raw_w": rawW,
+      "raw_h": rawH,
+    };
+    _jsonlSink!.writeln(jsonEncode(line));
+  }
+
+  List<double> _lbToRawXY(double x, double y, _LetterboxMeta m) {
+    final rx = (x - m.padX) / m.scale;
+    final ry = (y - m.padY) / m.scale;
+    final cx = rx.clamp(0.0, m.srcW.toDouble());
+    final cy = ry.clamp(0.0, m.srcH.toDouble());
+    return [cx, cy];
+  }
 }
