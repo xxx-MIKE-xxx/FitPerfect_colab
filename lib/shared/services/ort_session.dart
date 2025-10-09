@@ -35,9 +35,9 @@ class OrtManager {
         data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
 
     try {
-      OrtEnv.instance.loggingSeverityLevel = OrtLoggingLevel.warning;
+      OrtEnv.instance.init(level: OrtLoggingLevel.warning);
     } catch (_) {
-      // Older plugin versions may not expose logging severity setters.
+      // Environment may already be initialized or the plugin may not expose init options.
     }
 
     final options = OrtSessionOptions();
