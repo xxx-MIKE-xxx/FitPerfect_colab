@@ -1,4 +1,6 @@
 Pipeline „gotowy do pracy”
+
+
 0) Preflight 1.5 s (YOLO → RTMPose na ORT)
 
 Cel: Zmierzyć realny koszt Twojego 2D-pipeline (detekcja „person” YOLO + top-down RTMPose) na tym urządzeniu i zdecydować: live czy post-process. Wykonanie przez ONNX Runtime (Android/iOS: NNAPI/Core ML dostępne) — w Flutterze użyj flutter_onnxruntime lub onnxruntime z Pub. 
