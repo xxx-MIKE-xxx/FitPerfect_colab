@@ -377,11 +377,11 @@ class VideoPosePipeline {
     final Float32List buf = Float32List(plane * 3);
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
-        final int pixel = im.getPixel(x, y);
+        final img.Pixel pixel = im.getPixel(x, y);
         final int idx = y * w + x;
-        buf[idx] = img.getRed(pixel) / 255.0;
-        buf[plane + idx] = img.getGreen(pixel) / 255.0;
-        buf[(plane * 2) + idx] = img.getBlue(pixel) / 255.0;
+        buf[idx] = pixel.rNormalized.toDouble();
+        buf[plane + idx] = pixel.gNormalized.toDouble();
+        buf[(plane * 2) + idx] = pixel.bNormalized.toDouble();
       }
     }
     return OrtValueTensor.createTensorWithDataList(buf, [1, 3, h, w]);
@@ -396,11 +396,11 @@ class VideoPosePipeline {
     const List<double> std = [0.229, 0.224, 0.225];
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
-        final int pixel = patch.getPixel(x, y);
+        final img.Pixel pixel = patch.getPixel(x, y);
         final int idx = y * w + x;
-        final double r = img.getRed(pixel) / 255.0;
-        final double g = img.getGreen(pixel) / 255.0;
-        final double b = img.getBlue(pixel) / 255.0;
+        final double r = pixel.rNormalized.toDouble();
+        final double g = pixel.gNormalized.toDouble();
+        final double b = pixel.bNormalized.toDouble();
         buf[idx] = (r - mean[0]) / std[0];
         buf[plane + idx] = (g - mean[1]) / std[1];
         buf[(plane * 2) + idx] = (b - mean[2]) / std[2];
