@@ -31,6 +31,7 @@ import '../shared/services/live_pose.dart'; // LIVE RTM-Pose 2D
 import '../shared/services/pose_matcher.dart';
 import '../shared/services/pose_runtime.dart'; // offline pipeline
 import '../shared/services/pose_processing_controller.dart';
+import '../shared/services/video_pose_pipeline.dart';
 import '../shared/services/s3_uploader.dart';
 import '../shared/services/video_transcoder.dart'; // 10fps helper
 import '../shared/widgets/live_skeleton_overlay.dart';
@@ -582,10 +583,13 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
 
     try {
       _showProcessingDialog();
-      final pipeline = PosePipeline();
-      final res = await pipeline.analyzeVideo(file);
+      final pipeline = VideoPosePipeline();
+      final summary = await pipeline.run(
+        video: file,
+        sessionId: generateSessionId(),
+      );
 
-      final report = res.toReport(); // now contains kpts
+      final report = summary.poseResult.toReport(); // now contains kpts
       final savedPath = await _saveLocalReport(report);
       _hideProcessingDialog();
 
