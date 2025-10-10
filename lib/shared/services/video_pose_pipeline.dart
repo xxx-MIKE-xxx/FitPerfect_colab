@@ -10,7 +10,7 @@ import 'package:path/path.dart' as p;
 import 'ort_session.dart';
 import 'pose_runtime.dart';
 import 'storage_layout.dart';
-import 'video_sampler.dart';
+import 'video_sampler.dart' as sampler;
 
 class PreflightSummary {
   PreflightSummary({
@@ -103,8 +103,8 @@ class VideoPosePipeline {
     final int fpsTarget = math.max(1, preflight.fpsTarget);
     final int dtMs = preflight.dtMs > 0 ? preflight.dtMs : (1000 / fpsTarget).round();
 
-    final VideoFrameBatch batch =
-        await VideoSampler.extractFramesAtFps(video, fpsTarget.toDouble());
+    final sampler.VideoFrameBatch batch =
+        await sampler.VideoSampler.extractFramesAtFps(video, fpsTarget.toDouble());
 
     final File out2d = await StorageLayout.out2dFile(sessionId);
     final IOSink out2dSink = out2d.openWrite(mode: FileMode.write);
@@ -231,8 +231,8 @@ class VideoPosePipeline {
   }
 
   Future<img.Image?> _loadReferenceFrame(File video) async {
-    final VideoFrameBatch batch =
-        await VideoSampler.extractFramesAtFps(video, 1.0, maxFrames: 1);
+    final sampler.VideoFrameBatch batch =
+        await sampler.VideoSampler.extractFramesAtFps(video, 1.0, maxFrames: 1);
     try {
       if (batch.files.isEmpty) {
         return null;
