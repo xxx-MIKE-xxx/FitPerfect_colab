@@ -12,6 +12,25 @@ import 'pose_runtime.dart';
 import 'storage_layout.dart';
 import 'video_sampler.dart' as sampler;
 
+// Backwards-compatible aliases for legacy sampler API names that are still used
+// in parts of the application. The original implementation has moved to
+// [VideoSampler], which returns [VideoFrameBatch]. Providing the aliases here
+// ensures older call sites that expect [FrameBatch] and
+// [extractFramesAtFps(...)] continue to work without touching every import.
+typedef FrameBatch = sampler.VideoFrameBatch;
+
+Future<FrameBatch> extractFramesAtFps(
+  File src,
+  double fps, {
+  int? maxFrames,
+}) {
+  return sampler.VideoSampler.extractFramesAtFps(
+    src,
+    fps,
+    maxFrames: maxFrames,
+  );
+}
+
 class PreflightSummary {
   PreflightSummary({
     required this.medianMs,
