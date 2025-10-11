@@ -57,13 +57,31 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
   bool _loading = false;
   String? _error;
   Map<String, dynamic>? _summary; // parsed 3D summary
+  String? _out3dPath;
 
   @override
   void initState() {
     super.initState();
-    if (widget.out3dPath != null) {
-      _load3d(widget.out3dPath!);
+    _out3dPath = _sanitizeOut3dPath(widget.out3dPath);
+    if (_out3dPath != null) {
+      _load3d(_out3dPath!);
     }
+  }
+
+  String? _sanitizeOut3dPath(String? raw) {
+    if (raw == null || raw.isEmpty) {
+      return null;
+    }
+    final lower = raw.toLowerCase();
+    const allowed = ['.json', '.jsonl'];
+    final isAllowed = allowed.any(lower.endsWith);
+    if (!isAllowed) {
+      if (kDebugMode) {
+        debugPrint('[FeedbackSummary] Ignoring non-JSON out3dPath: $raw');
+      }
+      return null;
+    }
+    return raw;
   }
 
   Future<void> _load3d(String path) async {
@@ -231,7 +249,7 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final has3d = widget.out3dPath != null;
+    final has3d = _out3dPath != null;
 
     return Scaffold(
       appBar: AppBar(
@@ -282,7 +300,7 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
   }
 
   Widget _build3D(BuildContext context) {
-    final out3dPath = widget.out3dPath!;
+    final out3dPath = _out3dPath!;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [

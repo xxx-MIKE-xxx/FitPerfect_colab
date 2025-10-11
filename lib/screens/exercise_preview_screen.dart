@@ -714,12 +714,14 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
     if (!mounted) return;
     await _suspendCameraForRouteChange();
     if (!mounted) return;
+    final out3dPath = report['out3dPath'];
     context.go(
       '/feedback',
       extra: {
         'videoPath': videoPath,
         'videoKey': s3Path,
         'report': report,
+        if (out3dPath is String && out3dPath.isNotEmpty) 'out3dPath': out3dPath,
       },
     );
   }
