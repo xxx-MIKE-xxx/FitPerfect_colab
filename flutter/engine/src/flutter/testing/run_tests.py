@@ -1267,12 +1267,20 @@ Flutter Wiki page on the subject: https://github.com/flutter/flutter/wiki/Testin
 
   logger.addHandler(console_logger_handler)
   logger.addHandler(file_logger_handler)
-  logger.setLevel(logging.INFO)
+  logger.setLevel(logging.DEBUG)
+  logger.propagate = False
+
+  root_logger = logging.getLogger()
+  root_logger.setLevel(logging.DEBUG)
+  if console_logger_handler not in root_logger.handlers:
+    root_logger.addHandler(console_logger_handler)
+  if file_logger_handler not in root_logger.handlers:
+    root_logger.addHandler(file_logger_handler)
+
+  file_logger_handler.setLevel(logging.DEBUG)
+  console_logger_handler.setLevel(logging.DEBUG)
   if args.quiet:
-    file_logger_handler.setLevel(logging.INFO)
     console_logger_handler.setLevel(logging.WARNING)
-  else:
-    console_logger_handler.setLevel(logging.INFO)
 
   if args.type == 'all':
     types = all_types
