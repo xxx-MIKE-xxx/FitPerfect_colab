@@ -16,12 +16,13 @@
 
 import 'dart:async';
 import 'dart:io';
-import 'dart:math';
 import 'dart:ui' show Size;
 
 import 'package:flutter/foundation.dart';
-import 'motionbert_runner.dart';
+import 'package:path/path.dart' as p;
+
 import 'storage_layout.dart';
+import 'video_pose_pipeline.dart';
 
 typedef SessionId = String;
 
@@ -133,10 +134,10 @@ class PoseProcessingCancelled implements Exception {
 
 /// Main controller used by UI. Keeps legacy fields/methods but focuses on 3D run.
 class PoseProcessingController extends ChangeNotifier {
-  PoseProcessingController({MotionBertRunner? runner})
-      : _runner = runner ?? MotionBertRunner();
+  PoseProcessingController({VideoPosePipeline? pipeline})
+      : _pipeline = pipeline ?? VideoPosePipeline();
 
-  final MotionBertRunner _runner;
+  final VideoPosePipeline _pipeline;
 
   final _progressCtrl = StreamController<ProgressEvent>.broadcast();
   Stream<ProgressEvent> get progressStream => _progressCtrl.stream;
@@ -149,40 +150,41 @@ class PoseProcessingController extends ChangeNotifier {
   /// New API for Option B: run only the MotionBERT step after live 2D is saved.
   ///
   /// Returns the generated out_3d.json on success; null on failure.
-  Future<File?> run3DForSession(SessionId sessionId, Size frameSize) async {
+  Future<File?> run3DForSession(
+    SessionId sessionId,
+    Size frameSize, {
+    File? videoFile,
+  }) async {
     if (_busy) {
       debugPrint('[PoseProcessingController] Busy; run3DForSession ignored.');
       return null;
     }
     _busy = true;
-    _progressCtrl.add(ProgressEvent.indeterminate(phase: 'Preparing MotionBERT'));
+    _progressCtrl.add(ProgressEvent.indeterminate(phase: 'Preparing pipeline'));
 
     try {
-      final primary = await StorageLayout.out2dFile(sessionId);
-      final shadow = await StorageLayout.cocoShadowFile(sessionId);
-      final legacy = await StorageLayout.legacyFramesJsonl(sessionId);
-      debugPrint('[PoseProcessingController] 2D lookup: '
-          'primary="${primary.path}", shadow="${shadow.path}", legacy="${legacy.path}"');
+      debugPrint('[PoseProcessingController] run3DForSession session=$sessionId frameSize=$frameSize');
 
-      final primaryExists = await primary.exists();
-      final shadowExists = await shadow.exists();
-      final legacyExists = await legacy.exists();
-      debugPrint('[PoseProcessingController] 2D presence: '
-          'primary=$primaryExists, shadow=$shadowExists, legacy=$legacyExists');
+      File? inputVideo = videoFile;
+      if (inputVideo == null) {
+        final Directory dir = await StorageLayout.sessionDir(sessionId);
+        final File candidate = File(p.join(dir.path, 'video.mp4'));
+        if (!await candidate.exists()) {
+          throw StateError('Session video not found. Provide videoFile when calling run3DForSession.');
+        }
+        inputVideo = candidate;
+      }
 
-      _progressCtrl.add(
-        ProgressEvent.indeterminate(phase: 'Running MotionBERT'),
-      );
+      _progressCtrl.add(ProgressEvent.indeterminate(phase: 'Running offline 2D'));
 
-      final out = await _runner.run(
+      final summary = await _pipeline.run(
+        video: inputVideo,
         sessionId: sessionId,
-        frameSize: frameSize,
-        rootRelative: true,
       );
 
-      debugPrint('[PoseProcessingController] MotionBERT wrote: ${out.path}');
-      _progressCtrl.add(ProgressEvent.complete(phase: 'MotionBERT complete'));
-      return out;
+      _progressCtrl.add(ProgressEvent.complete(phase: 'Pipeline complete'));
+      debugPrint('[PoseProcessingController] Pipeline wrote: ${summary.out3d.path}');
+      return summary.out3d;
     } on FileSystemException catch (e, st) {
       debugPrint('[PoseProcessingController][FS-ERROR] ${e.message}\n$st');
       _progressCtrl.add(ProgressEvent.error(e.message));

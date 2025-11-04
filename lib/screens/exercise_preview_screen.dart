@@ -1162,15 +1162,6 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
         } catch (e) {
           if (kDebugMode) debugPrint('[ExercisePreview] engine.stop error: $e');
         }
-        try {
-          final preview = _cam.value.previewSize;
-          final w = preview == null ? 0 : preview.height.toInt();
-          final h = preview == null ? 0 : preview.width.toInt();
-          await context.read<PoseProcessingController>()
-            .run3DForSession(_sessionId!, Size(w.toDouble(), h.toDouble()));
-        } catch (e) {
-          if (kDebugMode) debugPrint('[ExercisePreview] run3DForSession error: $e');
-        }
       }
 
       await Future.delayed(const Duration(milliseconds: 50)); // let native drain
@@ -1240,7 +1231,11 @@ class _ExercisePreviewScreenState extends State<ExercisePreviewScreen>
       final frameSize = Size(meta.width.toDouble(), meta.height.toDouble());
 
       // Run only the MotionBERT step (Option B).
-      final file3d = await _processingController.run3DForSession(sessionId, frameSize);
+      final file3d = await _processingController.run3DForSession(
+        sessionId,
+        frameSize,
+        videoFile: videoFile,
+      );
       final out3dPath = file3d?.path;
 
       // Minimal report payload. Your SummaryRepository can enrich/derive if needed.

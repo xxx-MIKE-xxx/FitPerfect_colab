@@ -41,14 +41,19 @@ class StorageLayout {
     return dir;
   }
 
+  static Future<File> yoloDetectionsFile(String sessionId) async {
+    final dir = await sessionDir(sessionId);
+    return File(p.join(dir.path, 'yolo_person.jsonl'));
+  }
+
   static Future<File> out2dFile(String sessionId) async {
     final dir = await sessionDir(sessionId);
-    return File(p.join(dir.path, 'out_2d.jsonl'));
+    return File(p.join(dir.path, 'coco_2d.jsonl'));
   }
 
   static Future<File> cocoShadowFile(String sessionId) async {
     final dir = await sessionDir(sessionId);
-    return File(p.join(dir.path, 'coco_2d.jsonl'));
+    return File(p.join(dir.path, 'coco_2d_shadow.jsonl'));
   }
 
   static Future<File> out2dIndexFile(String sessionId) async {

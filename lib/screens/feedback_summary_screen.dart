@@ -440,7 +440,7 @@ class _FeedbackSummaryScreenState extends State<FeedbackSummaryScreen> {
 
   Future<List<_SessionFileInfo>> _collectFileInfo(String sessionId) async {
     final targets = <String, Future<File>>{
-      'out_2d.jsonl': StorageLayout.out2dFile(sessionId),
+      'coco_2d.jsonl': StorageLayout.out2dFile(sessionId),
       'out_2d_index.json': StorageLayout.out2dIndexFile(sessionId),
       'out_3d.json': StorageLayout.out3dFile(sessionId),
       'out_3d_index.json': StorageLayout.out3dIndexFile(sessionId),

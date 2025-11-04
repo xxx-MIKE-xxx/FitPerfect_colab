@@ -25,25 +25,21 @@ class LivePoseEngine {
   // Session/JSONL
   String? _sessionId;
   Directory? _sessionDir;
-  IOSink? _jsonlSink;
-  File? _jsonlTmpFile;
-  File? _jsonlFinalFile;
-  File? _shadow2dFile;
+  IOSink? _yoloSink;
+  File? _yoloTmpFile;
+  File? _yoloFinalFile;
   IOSink? _yoloDecodeSink;
   ProcessingMode _processingMode = ProcessingMode.liveInMemory;
   int _framesWritten = 0;
   DateTime? _startedAt;
   int _lastImgW = 0;
   int _lastImgH = 0;
-  final _ConfidenceStats _confStats = _ConfidenceStats();
 
   final int yoloEvery;     // refresh detection every N frames
   final double roiMargin;  // crop expansion
 
   OrtSession? _yolo;
   OrtSession? _rtm;
-
-  Map<String, double>? _lbParams; // last letterbox parameters for logging/index
 
   Float32List? _yoloInputChw; // reusable buffer for YOLO input (1×3×640×640)
   Float32List? _rtmInputChw;  // reusable buffer for RTMPose input (1×3×256×192)
@@ -60,7 +56,7 @@ class LivePoseEngine {
   }
   ProcessingMode get processingMode => _processingMode;
 
-  /// Open the JSONL writer at Documents/FitPerfect/<sessionId>/out_2d.jsonl
+  /// Open the JSONL writer at Documents/FitPerfect/<sessionId>/yolo_person.jsonl
   Future<void> start({
     required CameraController controller,
     required String sessionId,
@@ -72,19 +68,15 @@ class LivePoseEngine {
     _sessionDir = await StorageLayout.sessionDir(sessionId);
 
     _processingMode = await _decideProcessingMode();
-    _jsonlFinalFile = await StorageLayout.out2dFile(sessionId);
-    _jsonlTmpFile = File('${_jsonlFinalFile!.path}.tmp');
-    _shadow2dFile = await StorageLayout.cocoShadowFile(sessionId);
-    _jsonlSink = _jsonlTmpFile!.openWrite(mode: FileMode.write);
+    _yoloFinalFile = await StorageLayout.yoloDetectionsFile(sessionId);
+    _yoloTmpFile = File('${_yoloFinalFile!.path}.tmp');
+    _yoloSink = _yoloTmpFile!.openWrite(mode: FileMode.write);
     _yoloDecodeSink = (await StorageLayout.yoloDecodeLog(sessionId)).openWrite(mode: FileMode.write);
 
     _framesWritten = 0;
     _startedAt = DateTime.now();
     _lastImgW = 0;
     _lastImgH = 0;
-    _confStats.reset();
-    _lbParams = null;
-
     await _writeMetaSeed(exerciseId: exerciseId, frameSize: frameSize);
     Log.i('LivePose', 'start session=$sessionId mode=${_processingMode.name}');
   }
@@ -94,38 +86,30 @@ class LivePoseEngine {
     final sid = _sessionId;
     if (sid == null) return null;
     try {
-      await _jsonlSink?.flush();
-      await _jsonlSink?.close();
+      await _yoloSink?.flush();
+      await _yoloSink?.close();
       await _yoloDecodeSink?.flush();
       await _yoloDecodeSink?.close();
 
-      if (_jsonlTmpFile != null && _jsonlFinalFile != null) {
-        if (await _jsonlTmpFile!.exists()) {
-          await _jsonlTmpFile!.rename(_jsonlFinalFile!.path);
-        }
-        if (_shadow2dFile != null) {
-          try {
-            await _jsonlFinalFile!.copy(_shadow2dFile!.path);
-          } catch (e) {
-            Log.w('LivePose', 'shadow copy failed: $e');
-          }
+      if (_yoloTmpFile != null && _yoloFinalFile != null) {
+        if (await _yoloTmpFile!.exists()) {
+          await _yoloTmpFile!.rename(_yoloFinalFile!.path);
         }
       }
 
       await _write2dIndex(sid);
       await _updateMetaOnStop(sid);
 
-      final size = await _jsonlFinalFile?.exists() == true
-          ? await _jsonlFinalFile!.length()
+      final size = await _yoloFinalFile?.exists() == true
+          ? await _yoloFinalFile!.length()
           : 0;
       Log.i('LivePose', 'CLOSE wrote $_framesWritten frames → '
-          '${_jsonlFinalFile?.path} (size=$size bytes)');
+          '${_yoloFinalFile?.path} (size=$size bytes)');
     } finally {
-      _jsonlSink = null;
+      _yoloSink = null;
       _yoloDecodeSink = null;
-      _jsonlTmpFile = null;
-      _jsonlFinalFile = null;
-      _shadow2dFile = null;
+      _yoloTmpFile = null;
+      _yoloFinalFile = null;
       _sessionId = null;
     }
     return sid;
@@ -178,21 +162,18 @@ class LivePoseEngine {
 
     // 5) Map kpts back to raw image space and return as offsets
     final rawOffsets = <Offset>[];
-    final rawTriples = <List<double>>[];
     for (final k in kpts640) {
       final xRaw = (k[0] - lb.meta.padX) / lb.meta.scale;
       final yRaw = (k[1] - lb.meta.padY) / lb.meta.scale;
       rawOffsets.add(Offset(xRaw, yRaw));
-      rawTriples.add([xRaw, yRaw, k[2]]);
     }
 
-    if (_jsonlSink != null && _lb != null && _roi != null) {
-      _appendJsonl(
-        kptsRaw: rawTriples,
+    if (_yoloSink != null && _roi != null) {
+      _appendYolo(
         bboxRaw: _roi!,
         rawW: cam.width,
         rawH: cam.height,
-        lb: lb.meta,
+        frameIdx: _frameIdx,
       );
     }
 
@@ -640,10 +621,8 @@ class LivePoseEngine {
       'fps': double.parse(fps.toStringAsFixed(3)),
       'imgW': _lastImgW,
       'imgH': _lastImgH,
-      'confidence': _confStats.toSummary(),
       'processingMode': _processingMode.name,
       'updatedAt': DateTime.now().toUtc().toIso8601String(),
-      if (_lbParams != null) 'letterbox': _lbParams,
     };
     await file.writeAsString(const JsonEncoder.withIndent('  ').convert(summary));
   }
@@ -670,58 +649,49 @@ class LivePoseEngine {
     await file.writeAsString(const JsonEncoder.withIndent('  ').convert(meta));
   }
 
-  void _appendJsonl({
-    required List<List<double>> kptsRaw, // [17][3] in raw px
-    required _Det bboxRaw,               // raw px
+  void _appendYolo({
+    required _Det bboxRaw,
     required int rawW,
     required int rawH,
-    required _LetterboxMeta lb,
+    required int frameIdx,
   }) {
-    if (_jsonlSink == null) return;
-    final elapsed = _startedAt != null
-        ? DateTime.now().difference(_startedAt!).inMilliseconds / 1000.0
-        : 0.0;
-    final bboxNorm = [
+    final sink = _yoloSink;
+    if (sink == null) return;
+    final int nowMs = DateTime.now().millisecondsSinceEpoch;
+    final double tSec = _startedAt == null
+        ? 0.0
+        : (nowMs - _startedAt!.millisecondsSinceEpoch) / 1000.0;
+
+    final List<double> bboxNorm = [
       bboxRaw.x1 / rawW,
       bboxRaw.y1 / rawH,
       bboxRaw.x2 / rawW,
       bboxRaw.y2 / rawH,
-    ].map((e) => double.parse(e.toStringAsFixed(6))).toList();
-    final frame = {
-      't': double.parse(elapsed.toStringAsFixed(3)),
-      'img_w': rawW,
-      'img_h': rawH,
-      'bbox': bboxNorm,
-      'kpt': kptsRaw
-          .map((kp) => kp.map((v) => double.parse(v.toStringAsFixed(5))).toList())
-          .toList(),
-      'lb': {
-        'scale': lb.scale,
-        'pad_x': lb.padX,
-        'pad_y': lb.padY,
-      },
-      'model': {
-        'yolo': 'yolov8n.onnx',
-        'rtm': 'rtmpose-m_256x192.onnx',
-      },
+    ].map((v) => double.parse(v.toStringAsFixed(6))).toList();
+
+    final record = <String, dynamic>{
+      't': double.parse(tSec.toStringAsFixed(3)),
+      'ts_ms': nowMs,
+      'frame_idx': frameIdx,
+      'frame_size': [rawH, rawW],
+      'bbox_raw': [
+        double.parse(bboxRaw.x1.toStringAsFixed(3)),
+        double.parse(bboxRaw.y1.toStringAsFixed(3)),
+        double.parse(bboxRaw.x2.toStringAsFixed(3)),
+        double.parse(bboxRaw.y2.toStringAsFixed(3)),
+      ],
+      'bbox_norm': bboxNorm,
       'score': double.parse(bboxRaw.score.toStringAsFixed(3)),
     };
 
-    _lbParams = {
-      'scale': lb.scale,
-      'pad_x': lb.padX,
-      'pad_y': lb.padY,
-    };
-
-    _jsonlSink!.writeln(jsonEncode(frame));
+    sink.writeln(jsonEncode(record));
     _framesWritten++;
     _lastImgW = rawW;
     _lastImgH = rawH;
-    _confStats.addFrame(kptsRaw);
 
     if (_yoloDecodeSink != null && _framesWritten % 30 == 0) {
-      final tVal = frame['t'];
-      final scoreVal = frame['score'];
+      final tVal = record['t'];
+      final scoreVal = record['score'];
       _yoloDecodeSink!.writeln(
         '[frame=$_framesWritten] t=$tVal bbox=${bboxNorm.map((v) => v.toStringAsFixed(3)).join(',')} '
         'score=$scoreVal',
@@ -808,40 +778,4 @@ class _LetterboxResult {
 
   final img.Image square;
   final _LetterboxMeta meta;
-}
-
-class _ConfidenceStats {
-  double _sum = 0.0;
-  double _min = double.infinity;
-  double _max = 0.0;
-  int _count = 0;
-
-  void reset() {
-    _sum = 0.0;
-    _min = double.infinity;
-    _max = 0.0;
-    _count = 0;
-  }
-
-  void addFrame(List<List<double>> joints) {
-    for (final joint in joints) {
-      if (joint.length < 3) continue;
-      final conf = joint[2];
-      _sum += conf;
-      _min = math.min(_min, conf);
-      _max = math.max(_max, conf);
-      _count++;
-    }
-  }
-
-  Map<String, double> toSummary() {
-    if (_count == 0) {
-      return {'mean': 0.0, 'min': 0.0, 'max': 0.0};
-    }
-    return {
-      'mean': _sum / _count,
-      'min': _min.isFinite ? _min : 0.0,
-      'max': _max,
-    };
-  }
 }
